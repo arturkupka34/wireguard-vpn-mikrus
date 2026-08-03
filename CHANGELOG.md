@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.2.3
+
+- poprawiono niejednoznaczny dla parsera ShellCheck wzorzec sprawdzający zamykający nawias IPv6;
+- dodano statyczną dyrektywę `source` w teście dymnym, aby ShellCheck analizował właściwy plik;
+- dodano precyzyjne wyciszenie SC2034 dla `NETWORK_BASE`, która jest odczytywana przez funkcję z dołączonego skryptu;
+- dodano test regresji dla niedomkniętego adresu IPv6 i ponownie wygenerowano sumę źródła.
+
 ## 3.2.2
 
 - poprawiono ostrzeżenie ShellCheck SC2155 w funkcji tworzenia kopii zapasowej: deklaracja zmiennej i przypisanie z `date` są teraz rozdzielone;

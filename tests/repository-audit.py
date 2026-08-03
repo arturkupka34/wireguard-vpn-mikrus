@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEXT_SUFFIXES = {".sh", ".py", ".ps1", ".yml", ".yaml", ".md", ".txt", ".example", ""}
-EXPECTED_VERSION = "3.2.2"
+EXPECTED_VERSION = "3.2.3"
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 

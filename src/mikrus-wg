@@ -7,7 +7,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly APP_NAME="mikrus-wg"
-readonly VERSION="3.2.2"
+readonly VERSION="3.2.3"
 readonly INSTALL_PATH="/usr/local/sbin/${APP_NAME}"
 readonly STATE_DIR="/etc/mikrus-wg"
 readonly WIREGUARD_DIR="/etc/wireguard"
@@ -267,7 +267,7 @@ validate_endpoint() {
 
   host=$value
   if [[ "$host" == \[* ]]; then
-    [[ "$host" == *\] ]] || die "Brakuje zamykającego nawiasu w adresie IPv6."
+    [[ ${host: -1} == ']' ]] || die "Brakuje zamykającego nawiasu w adresie IPv6."
     host=${host#\[}
     host=${host%\]}
     [[ "$host" != *'['* && "$host" != *']'* ]] || die "Nieprawidłowy endpoint IPv6."

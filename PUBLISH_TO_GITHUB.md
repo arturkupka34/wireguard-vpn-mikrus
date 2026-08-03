@@ -8,7 +8,7 @@ Najpewniejsza metoda to GitHub Desktop albo zwykły Git. Nie przesyłaj plików 
 2. W GitHub Desktop wybierz **Repository → Show in Explorer**.
 3. Skopiuj całą zawartość tej paczki do sklonowanego katalogu, ale nie usuwaj znajdującego się tam katalogu `.git`.
 4. Sprawdź, czy istnieje `.github/workflows/ci.yml`.
-5. W GitHub Desktop wpisz podsumowanie `Release 3.2.2`, kliknij **Commit to main**, a następnie **Push origin**.
+5. W GitHub Desktop wpisz podsumowanie `Release 3.2.3`, kliknij **Commit to main**, a następnie **Push origin**.
 6. Otwórz zakładkę **Actions** i sprawdź najnowszy workflow `CI`.
 
 ## Git w terminalu
@@ -19,7 +19,7 @@ cd wireguard-vpn-mikrus
 # Skopiuj tutaj zawartość paczki, nie usuwając katalogu .git.
 git add -A
 git status
-git commit -m "Release 3.2.2"
+git commit -m "Release 3.2.3"
 git push origin main
 ```
 

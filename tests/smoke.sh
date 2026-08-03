@@ -37,7 +37,7 @@ for script in "${scripts[@]}"; do
 done
 
 version=$(bash "$ROOT/src/mikrus-wg" version)
-[[ "$version" == "mikrus-wg 3.2.2" ]] || fail "nieprawidłowa wersja: $version"
+[[ "$version" == "mikrus-wg 3.2.3" ]] || fail "nieprawidłowa wersja: $version"
 
 help=$(bash "$ROOT/src/mikrus-wg" --help)
 grep -q "prywatny split-tunnel" <<<"$help" || fail "brak opisu split-tunnel"
@@ -79,7 +79,8 @@ if grep -Fq 'source "$SETTINGS_FILE"' "$ROOT/src/mikrus-wg"; then
 fi
 
 # Lekkie testy funkcji bez wprowadzania zmian systemowych.
-# shellcheck disable=SC1091
+# shellcheck source=../src/mikrus-wg
+# shellcheck disable=SC1090
 source "$ROOT/src/mikrus-wg"
 
 validate_name "laptop-01"
@@ -104,9 +105,11 @@ validate_keepalive "0"
 validate_keepalive "25"
 validate_admin_slots "5"
 validate_custom_ports "tcp:3389,udp:3389,tcp:22,icmp"
-validate_ref "v3.2.2"
+validate_ref "v3.2.3"
 validate_repository "arturkupka34/wireguard-vpn-mikrus"
 validate_wg_key "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+# Zmienna jest odczytywana przez validate_client_ip z dołączonego skryptu.
+# shellcheck disable=SC2034
 NETWORK_BASE="10.77.77"
 validate_client_ip "10.77.77.2"
 validate_client_ip "10.77.77.254"
