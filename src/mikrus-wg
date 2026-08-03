@@ -1,0 +1,1973 @@
+#!/usr/bin/env bash
+# mikrus-wg - lekki menedżer WireGuard typu split-tunnel dla serwerów Mikrus.
+# Tunel służy do komunikacji między urządzeniami. Nie jest bramą internetową.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly APP_NAME="mikrus-wg"
+readonly VERSION="3.2.3"
+readonly INSTALL_PATH="/usr/local/sbin/${APP_NAME}"
+readonly STATE_DIR="/etc/mikrus-wg"
+readonly WIREGUARD_DIR="/etc/wireguard"
+readonly CLIENTS_DIR="${STATE_DIR}/clients"
+readonly SETTINGS_FILE="${STATE_DIR}/settings"
+readonly SERVER_PRIVATE_KEY_FILE="${STATE_DIR}/server.key"
+readonly SERVER_PUBLIC_KEY_FILE="${STATE_DIR}/server.pub"
+readonly SYSCTL_FILE="/etc/sysctl.d/99-mikrus-wireguard.conf"
+readonly LOCK_FILE="/run/lock/${APP_NAME}.lock"
+readonly FW_INPUT_CHAIN="MIKRUS_WG_INPUT"
+readonly FW_FORWARD_CHAIN="MIKRUS_WG_FORWARD"
+readonly FW_INPUT_NEXT_CHAIN="MIKRUS_WG_INPUT_NEXT"
+readonly FW_FORWARD_NEXT_CHAIN="MIKRUS_WG_FORWARD_NEXT"
+
+declare -a CLIENT_DIRS=()
+readonly DEFAULT_ENDPOINT="xander504.mikr.us.xyz"
+readonly DEFAULT_MIKRUS_ID="504"
+readonly DEFAULT_REPOSITORY="arturkupka34/wireguard-vpn-mikrus"
+
+if [[ -t 1 ]]; then
+  readonly C_RESET=$'\033[0m'
+  readonly C_RED=$'\033[0;31m'
+  readonly C_GREEN=$'\033[0;32m'
+  readonly C_YELLOW=$'\033[0;33m'
+  readonly C_BLUE=$'\033[0;34m'
+else
+  readonly C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
+fi
+
+log()  { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok()   { printf '%s[OK]%s   %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[UWAGA]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s[BŁĄD]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+
+on_error() {
+  local line=$1 status=$2
+  printf '%s[BŁĄD]%s Polecenie nie powiodło się (linia %s, kod %s).\n' \
+    "$C_RED" "$C_RESET" "$line" "$status" >&2
+  exit "$status"
+}
+trap 'on_error "$LINENO" "$?"' ERR
+
+usage() {
+  cat <<'USAGE'
+Mikrus WireGuard — prywatny split-tunnel z kontrolą dostępu
+
+Instalacja:
+  mikrus-wg install [opcje]
+
+Klienci:
+  mikrus-wg add NAZWA [auto|admin|member]
+  mikrus-wg set-role NAZWA admin|member
+  mikrus-wg remove NAZWA
+  mikrus-wg list
+  mikrus-wg show NAZWA
+  mikrus-wg qr NAZWA
+  mikrus-wg export NAZWA [PLIK]
+
+Administracja:
+  mikrus-wg status
+  mikrus-wg doctor
+  mikrus-wg restart
+  mikrus-wg set-endpoint HOST [PORT]
+  mikrus-wg set-policy acl|mesh|rdp|custom [REGUŁY]
+  mikrus-wg backup [PLIK.tar.gz]
+  mikrus-wg update
+  mikrus-wg uninstall [--yes]
+
+Opcje instalacji:
+  --mikrus-id ID           ID maszyny; domyślnie 504; port zostanie ustawiony na 20000+ID
+  --endpoint HOST          publiczny host; domyślnie xander504.mikr.us.xyz
+  --port PORT              ręczne nadpisanie portu UDP
+  --client NAZWA           pierwszy klient; domyślnie admin-1
+  --no-client              nie twórz pierwszego klienta
+  --network A.B.C          prywatna podsieć A.B.C.0/24; domyślnie 10.77.77
+  --interface NAZWA        interfejs WireGuard; domyślnie wg0
+  --policy TRYB            acl, mesh, rdp albo custom; domyślnie acl
+  --admin-slots LICZBA     pierwsze N adresów klientów otrzymuje rolę admin; domyślnie 5
+  --allowed-ports REGUŁY   dla custom, np. tcp:3389,udp:3389,tcp:22,icmp
+  --keepalive SEKUNDY      domyślnie 25; 0 wyłącza
+  --repository OWNER/REPO  repozytorium używane przez polecenie update
+  --ref REF                gałąź lub tag używany przez update; domyślnie main
+
+Role w polityce acl:
+  admin   może inicjować połączenia do wszystkich klientów VPN
+  member  nie może inicjować połączeń do innych klientów, ale może odpowiadać
+  auto    adresy .2-.6 są adminami przy domyślnych pięciu slotach; kolejne są member
+
+Tryby ruchu między klientami:
+  acl     administratorzy inicjują połączenia do wszystkich; członkowie tylko odpowiadają
+  mesh    cały ruch w prywatnej podsieci VPN
+  rdp     ICMP oraz TCP/UDP 3389
+  custom  wyłącznie reguły z --allowed-ports
+
+Gwarancje:
+  * profile klientów zawierają AllowedIPs tylko dla prywatnej podsieci VPN;
+  * instalator nie tworzy NAT ani MASQUERADE;
+  * klienci nie mają dostępu do usług uruchomionych na samym Mikrusie;
+  * firewall blokuje wyjście z WireGuard do zwykłej karty VPS.
+USAGE
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "Uruchom polecenie jako root, np. przez sudo."
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Brak wymaganego polecenia: $1"
+}
+
+acquire_lock() {
+  local lock_dir owner
+  lock_dir=$(dirname -- "$LOCK_FILE")
+  mkdir -p -- "$lock_dir"
+  [[ ! -L "$LOCK_FILE" ]] || die "Plik blokady jest dowiązaniem symbolicznym: $LOCK_FILE"
+  exec 9>"$LOCK_FILE"
+  chmod 600 "$LOCK_FILE"
+  owner=$(stat -c '%u' "$LOCK_FILE")
+  [[ "$owner" == "0" ]] || die "Plik blokady nie należy do roota: $LOCK_FILE"
+  flock -x 9
+}
+
+release_lock() {
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+}
+
+atomic_install_file() {
+  local source=$1 destination=$2 mode=$3 temp_file
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  [[ ! -L "$destination" && ! -d "$destination" ]] || return 1
+  temp_file=$(mktemp "${destination}.tmp.XXXXXX") || return 1
+  if ! install -m "$mode" -- "$source" "$temp_file" ||
+     ! mv -f -- "$temp_file" "$destination"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+require_secure_directory() {
+  local path=$1 description=${2:-"katalog"} owner mode
+  [[ -d "$path" && ! -L "$path" ]] || die "Brak bezpiecznego katalogu: ${description}."
+  owner=$(stat -c '%u' "$path") || die "Nie można odczytać właściciela katalogu: ${description}."
+  mode=$(stat -c '%a' "$path") || die "Nie można odczytać uprawnień katalogu: ${description}."
+  [[ "$owner" == "0" ]] || die "Katalog ${description} nie należy do roota."
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "Nieprawidłowe uprawnienia katalogu: ${description}."
+  (( (8#$mode & 077) == 0 )) || die "Katalog ${description} jest dostępny dla grupy albo innych użytkowników."
+}
+
+require_secure_file() {
+  local path=$1 description=${2:-"plik"} owner mode
+  [[ -f "$path" && ! -L "$path" ]] || die "Brak bezpiecznego pliku: ${description}."
+  owner=$(stat -c '%u' "$path") || die "Nie można odczytać właściciela pliku: ${description}."
+  mode=$(stat -c '%a' "$path") || die "Nie można odczytać uprawnień pliku: ${description}."
+  [[ "$owner" == "0" ]] || die "Plik ${description} nie należy do roota."
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "Nieprawidłowe uprawnienia pliku: ${description}."
+  (( (8#$mode & 077) == 0 )) || die "Plik ${description} jest dostępny dla grupy albo innych użytkowników."
+}
+
+require_root_file() {
+  local path=$1 description=${2:-"plik"} owner
+  [[ -f "$path" && ! -L "$path" ]] || die "Brak bezpiecznego pliku: ${description}."
+  owner=$(stat -c '%u' "$path") || die "Nie można odczytać właściciela pliku: ${description}."
+  [[ "$owner" == "0" ]] || die "Plik ${description} nie należy do roota."
+}
+
+require_root_directory() {
+  local path=$1 description=${2:-"katalog"} owner
+  [[ -d "$path" && ! -L "$path" ]] || die "Brak bezpiecznego katalogu: ${description}."
+  owner=$(stat -c '%u' "$path") || die "Nie można odczytać właściciela katalogu: ${description}."
+  [[ "$owner" == "0" ]] || die "Katalog ${description} nie należy do roota."
+}
+
+collect_client_dirs() {
+  require_secure_directory "$CLIENTS_DIR" "katalog klientów"
+  CLIENT_DIRS=()
+  local path nullglob_was_set=0
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+  for path in "$CLIENTS_DIR"/*; do
+    [[ -d "$path" && ! -L "$path" ]] || die "W katalogu klientów wykryto niebezpieczny wpis: $path"
+    CLIENT_DIRS+=("$path")
+  done
+  (( nullglob_was_set == 1 )) || shopt -u nullglob
+}
+
+ensure_no_pending_transactions() {
+  require_secure_directory "$CLIENTS_DIR" "katalog klientów"
+  local pending
+  pending=$(find "$CLIENTS_DIR" -mindepth 1 -maxdepth 1 -name '.*' -print -quit) ||
+    die "Nie można sprawdzić niedokończonych transakcji klientów."
+  [[ -z "$pending" ]] ||
+    die "Wykryto niedokończoną transakcję klienta: $pending. Uruchom 'sudo ${APP_NAME} doctor' i napraw stan przed kolejną zmianą."
+}
+
+validate_name() {
+  local value=${1:-}
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] ||
+    die "Nazwa klienta: 1–32 znaki; litery, cyfry, podkreślenie i myślnik."
+}
+
+validate_interface() {
+  local value=${1:-}
+  [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$ ]] ||
+    die "Nazwa interfejsu musi mieć 1–15 bezpiecznych znaków."
+}
+
+validate_ipv4_literal() {
+  local value=$1 a b c d extra octet numeric
+  IFS='.' read -r a b c d extra <<<"$value"
+  [[ -n "${a:-}" && -n "${b:-}" && -n "${c:-}" && -n "${d:-}" && -z "${extra:-}" ]] || return 1
+  for octet in "$a" "$b" "$c" "$d"; do
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    numeric=$((10#$octet))
+    (( numeric <= 255 )) || return 1
+  done
+}
+
+validate_ipv6_literal() {
+  local value=$1 marked group count=0 compressed=0
+  local -a groups
+  [[ "$value" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$value" == *:* && "$value" != *:::* ]] || return 1
+  [[ "$value" != :* || "$value" == ::* ]] || return 1
+  [[ "$value" != *: || "$value" == *:: ]] || return 1
+
+  if [[ "$value" == *::* ]]; then
+    [[ "${value#*::}" != *::* ]] || return 1
+    compressed=1
+    marked=${value/::/:x:}
+  else
+    marked=$value
+  fi
+
+  IFS=':' read -ra groups <<<"$marked"
+  for group in "${groups[@]}"; do
+    [[ -n "$group" ]] || continue
+    [[ "$group" == "x" ]] && continue
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    count=$((count + 1))
+  done
+
+  if (( compressed == 1 )); then
+    (( count < 8 ))
+  else
+    (( count == 8 ))
+  fi
+}
+
+validate_endpoint() {
+  local value=${1:-} host label
+  local -a labels
+  [[ -n "$value" ]] || die "Endpoint nie może być pusty."
+  (( ${#value} <= 253 )) || die "Endpoint jest zbyt długi."
+  [[ "$value" != *[[:space:]]* ]] || die "Endpoint nie może zawierać spacji."
+  [[ "$value" != */* ]] || die "Endpoint podaj bez protokołu i ścieżki."
+
+  host=$value
+  if [[ "$host" == \[* ]]; then
+    [[ ${host: -1} == ']' ]] || die "Brakuje zamykającego nawiasu w adresie IPv6."
+    host=${host#\[}
+    host=${host%\]}
+    [[ "$host" != *'['* && "$host" != *']'* ]] || die "Nieprawidłowy endpoint IPv6."
+  elif [[ "$host" == *'['* || "$host" == *']'* ]]; then
+    die "Nieprawidłowy endpoint IPv6."
+  fi
+
+  if [[ "$host" == *:* ]]; then
+    validate_ipv6_literal "$host" || die "Nieprawidłowy adres IPv6."
+    return 0
+  fi
+
+  if [[ "$host" =~ ^[0-9.]+$ ]]; then
+    validate_ipv4_literal "$host" || die "Nieprawidłowy adres IPv4."
+    return 0
+  fi
+
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] ||
+    die "Endpoint może zawierać tylko litery ASCII, cyfry, kropki i myślniki."
+  [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] ||
+    die "Nieprawidłowa nazwa hosta."
+
+  IFS='.' read -ra labels <<<"$host"
+  for label in "${labels[@]}"; do
+    [[ -n "$label" && ${#label} -le 63 ]] || die "Nieprawidłowa etykieta nazwy hosta."
+    [[ "$label" != -* && "$label" != *- ]] || die "Etykieta hosta nie może zaczynać się ani kończyć myślnikiem."
+  done
+}
+
+validate_port() {
+  local value=${1:-} numeric
+  [[ "$value" =~ ^(0|[1-9][0-9]{0,4})$ ]] || die "Port musi być liczbą dziesiętną bez zer wiodących."
+  numeric=$((10#$value))
+  (( numeric >= 1 && numeric <= 65535 )) || die "Port musi należeć do zakresu 1–65535."
+}
+
+validate_keepalive() {
+  local value=${1:-} numeric
+  [[ "$value" =~ ^(0|[1-9][0-9]{0,4})$ ]] ||
+    die "Keepalive musi być liczbą dziesiętną bez zer wiodących."
+  numeric=$((10#$value))
+  (( numeric >= 0 && numeric <= 65535 )) || die "Keepalive musi należeć do zakresu 0–65535."
+}
+
+validate_network_base() {
+  local base=${1:-} a b c extra a_num b_num c_num
+  IFS='.' read -r a b c extra <<<"$base"
+  [[ -n "${a:-}" && -n "${b:-}" && -n "${c:-}" && -z "${extra:-}" ]] ||
+    die "Sieć podaj jako trzy oktety, np. 10.77.77."
+
+  local octet
+  for octet in "$a" "$b" "$c"; do
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+      die "Każdy oktet musi być liczbą 0–255 bez zer wiodących."
+  done
+
+  a_num=$((10#$a))
+  b_num=$((10#$b))
+  c_num=$((10#$c))
+  (( a_num <= 255 && b_num <= 255 && c_num <= 255 )) ||
+    die "Każdy oktet musi należeć do zakresu 0–255."
+  (( a_num == 10 || (a_num == 172 && b_num >= 16 && b_num <= 31) || (a_num == 192 && b_num == 168) )) ||
+    die "Użyj prywatnej sieci RFC1918, np. 10.77.77."
+}
+
+validate_policy() {
+  case "${1:-}" in
+    acl|mesh|rdp|custom) ;;
+    *) die "Nieznany tryb polityki. Użyj: acl, mesh, rdp albo custom." ;;
+  esac
+}
+
+validate_role() {
+  case "${1:-}" in
+    auto|admin|member) ;;
+    *) die "Nieznana rola. Użyj: auto, admin albo member." ;;
+  esac
+}
+
+validate_mikrus_id() {
+  local value=${1:-} numeric
+  [[ "$value" =~ ^[1-9][0-9]{0,3}$ ]] ||
+    die "ID Mikrusa musi być liczbą 1–9999 bez zer wiodących."
+  numeric=$((10#$value))
+  (( numeric >= 1 && numeric <= 9999 )) || die "ID Mikrusa musi należeć do zakresu 1–9999."
+}
+
+validate_admin_slots() {
+  local value=${1:-} numeric
+  [[ "$value" =~ ^[1-9][0-9]{0,2}$ ]] ||
+    die "Liczba slotów administratorów musi być liczbą 1–253 bez zer wiodących."
+  numeric=$((10#$value))
+  (( numeric >= 1 && numeric <= 253 )) ||
+    die "Liczba slotów administratorów musi należeć do zakresu 1–253."
+}
+
+validate_repository() {
+  local value=${1:-} owner repository extra
+  IFS='/' read -r owner repository extra <<<"$value"
+  [[ -n "$owner" && -n "$repository" && -z "${extra:-}" ]] ||
+    die "Repozytorium podaj jako OWNER/REPO."
+  [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ && "$repository" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    die "Repozytorium podaj jako OWNER/REPO."
+  [[ "$owner" != "." && "$owner" != ".." && "$repository" != "." && "$repository" != ".." ]] ||
+    die "Nieprawidłowa nazwa właściciela lub repozytorium."
+}
+
+validate_ref() {
+  local value=${1:-}
+  [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Nieprawidłowa gałąź lub tag GitHub."
+  [[ "$value" != /* && "$value" != */ && "$value" != *//* && "$value" != *".."* ]] ||
+    die "Nieprawidłowa gałąź lub tag GitHub."
+  [[ "$value" != *'@{'* && "$value" != *.lock && "$value" != '.' ]] ||
+    die "Nieprawidłowa gałąź lub tag GitHub."
+}
+
+validate_custom_ports() {
+  local rules=${1:-}
+  [[ -n "$rules" ]] || die "Tryb custom wymaga reguł, np. tcp:3389,udp:3389,tcp:22,icmp."
+  [[ "$rules" != ,* && "$rules" != *, && "$rules" != *,,* ]] ||
+    die "Lista reguł custom nie może zawierać pustych pozycji."
+
+  local item proto port
+  local -a items
+  local -A seen_rules=()
+  IFS=',' read -ra items <<<"$rules"
+  for item in "${items[@]}"; do
+    [[ -z ${seen_rules[$item]:-} ]] || die "Powtórzona reguła custom: $item."
+    seen_rules[$item]=1
+    if [[ "$item" == "icmp" ]]; then
+      continue
+    fi
+    IFS=':' read -r proto port <<<"$item"
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || die "Nieprawidłowa reguła: $item."
+    validate_port "$port"
+  done
+}
+
+validate_wg_key() {
+  local value=${1:-}
+  [[ "$value" =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "Wykryto nieprawidłowy klucz WireGuard w stanie programu."
+}
+
+validate_client_ip() {
+  local value=${1:-} prefix last_octet
+  validate_ipv4_literal "$value" || die "Nieprawidłowy adres IPv4 klienta: $value"
+  prefix=${value%.*}
+  last_octet=${value##*.}
+  [[ "$prefix" == "$NETWORK_BASE" ]] || die "Adres klienta nie należy do skonfigurowanej podsieci: $value"
+  (( 10#$last_octet >= 2 && 10#$last_octet <= 254 )) ||
+    die "Adres klienta musi kończyć się liczbą 2–254: $value"
+}
+
+format_endpoint() {
+  local endpoint=$1
+  if [[ "$endpoint" == *:* && "$endpoint" != \[*\] ]]; then
+    printf '[%s]' "$endpoint"
+  else
+    printf '%s' "$endpoint"
+  fi
+}
+
+wg_config_path() {
+  printf '%s/%s.conf' "$WIREGUARD_DIR" "$WG_IF"
+}
+
+load_settings() {
+  require_secure_directory "$STATE_DIR" "katalog stanu"
+  require_secure_directory "$CLIENTS_DIR" "katalog klientów"
+  require_secure_directory "$WIREGUARD_DIR" "katalog WireGuard"
+  require_secure_file "$SETTINGS_FILE" "ustawienia programu"
+  [[ $(stat -c '%a' "$SETTINGS_FILE") == "600" ]] ||
+    die "Plik ustawień musi mieć uprawnienia 600."
+
+  local key value
+  ENDPOINT="" WG_PORT="" NETWORK_BASE="" VPN_CIDR="" SERVER_VPN_IP=""
+  WG_IF="" POLICY="" CUSTOM_PORTS="" KEEPALIVE="" MIKRUS_ID=""
+  ADMIN_SLOTS="" SOURCE_REPOSITORY="" SOURCE_REF="" ORIGINAL_IP_FORWARD="0"
+
+  local -A seen=()
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    [[ -n "$key" ]] || continue
+    [[ "$key" != \#* ]] || continue
+    [[ -z ${seen[$key]:-} ]] || die "Powtórzony klucz w ustawieniach: $key"
+    seen[$key]=1
+    case "$key" in
+      ENDPOINT) ENDPOINT=$value ;;
+      WG_PORT) WG_PORT=$value ;;
+      NETWORK_BASE) NETWORK_BASE=$value ;;
+      VPN_CIDR) VPN_CIDR=$value ;;
+      SERVER_VPN_IP) SERVER_VPN_IP=$value ;;
+      WG_IF) WG_IF=$value ;;
+      POLICY) POLICY=$value ;;
+      CUSTOM_PORTS)
+        [[ "$value" == "''" ]] && value=""
+        CUSTOM_PORTS=$value
+        ;;
+      KEEPALIVE) KEEPALIVE=$value ;;
+      MIKRUS_ID) MIKRUS_ID=$value ;;
+      ADMIN_SLOTS) ADMIN_SLOTS=$value ;;
+      SOURCE_REPOSITORY) SOURCE_REPOSITORY=$value ;;
+      SOURCE_REF) SOURCE_REF=$value ;;
+      ORIGINAL_IP_FORWARD) ORIGINAL_IP_FORWARD=$value ;;
+      *) die "Nieznany klucz w ustawieniach: $key" ;;
+    esac
+  done <"$SETTINGS_FILE"
+
+  local required_key
+  for required_key in ENDPOINT WG_PORT NETWORK_BASE VPN_CIDR SERVER_VPN_IP WG_IF POLICY \
+    CUSTOM_PORTS KEEPALIVE MIKRUS_ID ADMIN_SLOTS SOURCE_REPOSITORY SOURCE_REF ORIGINAL_IP_FORWARD; do
+    [[ -n ${seen[$required_key]:-} ]] || die "Brak wymaganego klucza w ustawieniach: $required_key"
+  done
+
+  [[ -n "$ENDPOINT" && -n "$WG_PORT" && -n "$NETWORK_BASE" && -n "$VPN_CIDR" ]] ||
+    die "Plik ustawień jest niekompletny."
+  [[ -n "$SERVER_VPN_IP" && -n "$WG_IF" && -n "$POLICY" && -n "$KEEPALIVE" ]] ||
+    die "Plik ustawień jest niekompletny."
+  [[ -n "$ADMIN_SLOTS" && -n "$SOURCE_REPOSITORY" && -n "$SOURCE_REF" ]] ||
+    die "Plik ustawień jest niekompletny."
+
+  validate_endpoint "$ENDPOINT"
+  validate_port "$WG_PORT"
+  validate_network_base "$NETWORK_BASE"
+  validate_interface "$WG_IF"
+  validate_policy "$POLICY"
+  validate_keepalive "$KEEPALIVE"
+  validate_admin_slots "$ADMIN_SLOTS"
+  validate_repository "$SOURCE_REPOSITORY"
+  validate_ref "$SOURCE_REF"
+  [[ -z "$MIKRUS_ID" ]] || validate_mikrus_id "$MIKRUS_ID"
+  [[ "$ORIGINAL_IP_FORWARD" == "0" || "$ORIGINAL_IP_FORWARD" == "1" ]] ||
+    die "Nieprawidłowa zapisana wartość net.ipv4.ip_forward."
+  [[ "$VPN_CIDR" == "${NETWORK_BASE}.0/24" ]] || die "Niespójna podsieć VPN w ustawieniach."
+  [[ "$SERVER_VPN_IP" == "${NETWORK_BASE}.1" ]] || die "Niespójny adres serwera VPN w ustawieniach."
+  if [[ "$POLICY" == "custom" ]]; then
+    validate_custom_ports "$CUSTOM_PORTS"
+  elif [[ -n "$CUSTOM_PORTS" ]]; then
+    die "Reguły CUSTOM_PORTS są dozwolone tylko dla polityki custom."
+  fi
+}
+
+write_settings() {
+  [[ ! -L "$STATE_DIR" && ! -L "$CLIENTS_DIR" && ! -L "$WIREGUARD_DIR" ]] || return 1
+  [[ ! -L "$SETTINGS_FILE" && ! -d "$SETTINGS_FILE" ]] || return 1
+  mkdir -p -- "$STATE_DIR" "$CLIENTS_DIR" "$WIREGUARD_DIR" || return 1
+  chmod 700 "$STATE_DIR" "$CLIENTS_DIR" "$WIREGUARD_DIR" || return 1
+
+  local temp_file
+  temp_file=$(mktemp "${SETTINGS_FILE}.tmp.XXXXXX") || return 1
+  if ! {
+    printf 'ENDPOINT=%s\n' "$ENDPOINT"
+    printf 'WG_PORT=%s\n' "$WG_PORT"
+    printf 'NETWORK_BASE=%s\n' "$NETWORK_BASE"
+    printf 'VPN_CIDR=%s\n' "$VPN_CIDR"
+    printf 'SERVER_VPN_IP=%s\n' "$SERVER_VPN_IP"
+    printf 'WG_IF=%s\n' "$WG_IF"
+    printf 'POLICY=%s\n' "$POLICY"
+    printf 'CUSTOM_PORTS=%s\n' "$CUSTOM_PORTS"
+    printf 'KEEPALIVE=%s\n' "$KEEPALIVE"
+    printf 'MIKRUS_ID=%s\n' "$MIKRUS_ID"
+    printf 'ADMIN_SLOTS=%s\n' "$ADMIN_SLOTS"
+    printf 'SOURCE_REPOSITORY=%s\n' "$SOURCE_REPOSITORY"
+    printf 'SOURCE_REF=%s\n' "$SOURCE_REF"
+    printf 'ORIGINAL_IP_FORWARD=%s\n' "$ORIGINAL_IP_FORWARD"
+  } >"$temp_file"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! chmod 600 "$temp_file" || ! mv -f -- "$temp_file" "$SETTINGS_FILE"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+install_packages() {
+  [[ -r /etc/os-release ]] || die "Nie można rozpoznać systemu operacyjnego."
+  # shellcheck disable=SC1091
+  source /etc/os-release
+
+  case "${ID:-}" in
+    debian|ubuntu)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        wireguard-tools iproute2 iptables qrencode ca-certificates curl tar procps util-linux
+      ;;
+    *)
+      die "Obsługiwane są Debian i Ubuntu."
+      ;;
+  esac
+
+  local command
+  for command in wg wg-quick ip ss iptables iptables-save systemctl sysctl flock curl tar stat readlink find sort grep awk date mktemp install sha256sum; do
+    require_command "$command"
+  done
+}
+
+check_systemd() {
+  require_command systemctl
+  systemctl show-environment >/dev/null 2>&1 ||
+    die "Systemd nie działa jako menedżer systemu. Ten wariant wymaga systemd."
+}
+
+check_wireguard_capability() {
+  local test_if error_file attempt
+  error_file=$(mktemp) || return 1
+
+  for attempt in 1 2 3 4 5; do
+    test_if="wgt$((RANDOM % 10000))"
+    if ! ip link show "$test_if" >/dev/null 2>&1; then
+      break
+    fi
+    test_if=""
+  done
+  [[ -n "${test_if:-}" ]] || {
+    rm -f -- "$error_file"
+    die "Nie można znaleźć wolnej nazwy dla testowego interfejsu WireGuard."
+  }
+
+  if ! ip link add "$test_if" type wireguard 2>"$error_file"; then
+    cat "$error_file" >&2 || true
+    rm -f -- "$error_file"
+    die "System lub kontener nie pozwala utworzyć interfejsu WireGuard. Wymagane są WireGuard i CAP_NET_ADMIN."
+  fi
+  if ! ip link del "$test_if" 2>>"$error_file"; then
+    cat "$error_file" >&2 || true
+    rm -f -- "$error_file"
+    die "Utworzono testowy interfejs ${test_if}, ale nie można go usunąć. Usuń go ręcznie przed ponowną próbą."
+  fi
+  rm -f -- "$error_file"
+}
+
+check_install_conflicts() {
+  local interface=$1 port=$2 chain
+
+  if ip link show "$interface" >/dev/null 2>&1; then
+    die "Interfejs ${interface} już istnieje. Instalator nie zmienił konfiguracji WireGuard."
+  fi
+  if systemctl is-active --quiet "wg-quick@${interface}" 2>/dev/null; then
+    die "Usługa wg-quick@${interface} jest już aktywna. Instalator nie zmienił konfiguracji WireGuard."
+  fi
+  if systemctl is-enabled --quiet "wg-quick@${interface}" 2>/dev/null; then
+    die "Usługa wg-quick@${interface} jest już włączona. Wyjaśnij ten stan przed instalacją."
+  fi
+  if ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .; then
+    die "Port UDP ${port} jest już używany. Wybierz drugi port Mikrusa albo zatrzymaj kolidującą usługę."
+  fi
+  for chain in "$FW_INPUT_CHAIN" "$FW_FORWARD_CHAIN" "$FW_INPUT_NEXT_CHAIN" "$FW_FORWARD_NEXT_CHAIN"; do
+    if iptables -w -S "$chain" >/dev/null 2>&1; then
+      die "Łańcuch firewalla ${chain} już istnieje. Instalator nie będzie go nadpisywać."
+    fi
+  done
+}
+
+configure_forwarding() {
+  local temp_file
+  temp_file=$(mktemp "${SYSCTL_FILE}.tmp.XXXXXX") || return 1
+  if ! cat >"$temp_file" <<'EOF_SYSCTL'
+# Potrzebne wyłącznie do przekazywania pakietów między klientami WireGuard.
+net.ipv4.ip_forward = 1
+EOF_SYSCTL
+  then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! chmod 644 "$temp_file" || ! mv -f -- "$temp_file" "$SYSCTL_FILE"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null; then
+    rm -f -- "$SYSCTL_FILE"
+    return 1
+  fi
+}
+
+ensure_installed_self() {
+  local source_path=${BASH_SOURCE[0]:-}
+  [[ ! -L "$INSTALL_PATH" && ! -d "$INSTALL_PATH" ]] || return 1
+  if [[ -f "$source_path" && ! -L "$source_path" && "$source_path" != "/dev/stdin" ]]; then
+    source_path=$(readlink -f "$source_path") || return 1
+    if [[ "$source_path" != "$INSTALL_PATH" ]]; then
+      atomic_install_file "$source_path" "$INSTALL_PATH" 0755 || return 1
+    fi
+  fi
+
+  [[ -f "$INSTALL_PATH" && ! -L "$INSTALL_PATH" && -x "$INSTALL_PATH" ]] || {
+    warn "Nie można zainstalować pliku programu. Uruchom repozytoryjny install.sh."
+    return 1
+  }
+}
+
+generate_server_keys() {
+  local private_tmp public_tmp private_key public_key
+
+  if [[ -e "$SERVER_PRIVATE_KEY_FILE" || -e "$SERVER_PUBLIC_KEY_FILE" ]]; then
+    require_secure_file "$SERVER_PRIVATE_KEY_FILE" "prywatny klucz serwera"
+    require_secure_file "$SERVER_PUBLIC_KEY_FILE" "publiczny klucz serwera"
+  else
+    private_tmp=$(mktemp "${SERVER_PRIVATE_KEY_FILE}.tmp.XXXXXX") || return 1
+    public_tmp=$(mktemp "${SERVER_PUBLIC_KEY_FILE}.tmp.XXXXXX") || {
+      rm -f -- "$private_tmp"
+      return 1
+    }
+    if ! wg genkey >"$private_tmp" || ! wg pubkey <"$private_tmp" >"$public_tmp"; then
+      rm -f -- "$private_tmp" "$public_tmp"
+      return 1
+    fi
+    private_key=$(<"$private_tmp")
+    public_key=$(<"$public_tmp")
+    if ! (validate_wg_key "$private_key" && validate_wg_key "$public_key"); then
+      rm -f -- "$private_tmp" "$public_tmp"
+      return 1
+    fi
+    if ! chmod 600 "$private_tmp" "$public_tmp" ||
+       ! mv -f -- "$private_tmp" "$SERVER_PRIVATE_KEY_FILE" ||
+       ! mv -f -- "$public_tmp" "$SERVER_PUBLIC_KEY_FILE"; then
+      rm -f -- "$private_tmp" "$public_tmp"
+      return 1
+    fi
+  fi
+
+  private_key=$(<"$SERVER_PRIVATE_KEY_FILE")
+  public_key=$(<"$SERVER_PUBLIC_KEY_FILE")
+  validate_wg_key "$private_key"
+  validate_wg_key "$public_key"
+}
+
+iptables_delete_all_jumps() {
+  local parent=$1 child=$2
+  while iptables -w -C "$parent" -j "$child" 2>/dev/null; do
+    iptables -w -D "$parent" -j "$child" || return 1
+  done
+}
+
+iptables_chain_exists() {
+  iptables -w -S "$1" >/dev/null 2>&1
+}
+
+iptables_delete_chain() {
+  local parent=$1 chain=$2
+  iptables_delete_all_jumps "$parent" "$chain" || return 1
+  if iptables_chain_exists "$chain"; then
+    iptables -w -F "$chain" || return 1
+    iptables -w -X "$chain" || return 1
+  fi
+}
+
+iptables_recover_staging_chain() {
+  local parent=$1 stable=$2 staging=$3
+  iptables_chain_exists "$staging" || return 0
+
+  if iptables -w -C "$parent" -j "$staging" 2>/dev/null; then
+    # Łańcuch staging został już włączony w poprzedniej próbie. Dokończ
+    # promocję zamiast usuwać aktywną, bezpieczną politykę.
+    iptables_delete_all_jumps "$parent" "$stable" || return 1
+    if iptables_chain_exists "$stable"; then
+      iptables -w -F "$stable" || return 1
+      iptables -w -X "$stable" || return 1
+    fi
+    iptables -w -E "$staging" "$stable" || return 1
+  else
+    iptables -w -F "$staging" || return 1
+    iptables -w -X "$staging" || return 1
+  fi
+}
+
+iptables_promote_chain() {
+  local parent=$1 stable=$2 staging=$3
+  iptables -w -I "$parent" 1 -j "$staging" || return 1
+  iptables_delete_all_jumps "$parent" "$stable" || return 1
+  if iptables_chain_exists "$stable"; then
+    iptables -w -F "$stable" || return 1
+    iptables -w -X "$stable" || return 1
+  fi
+  iptables -w -E "$staging" "$stable" || return 1
+}
+
+firewall_cleanup_staging() {
+  iptables_delete_chain INPUT "$FW_INPUT_NEXT_CHAIN" >/dev/null 2>&1 || true
+  iptables_delete_chain FORWARD "$FW_FORWARD_NEXT_CHAIN" >/dev/null 2>&1 || true
+}
+
+firewall_up() {
+  require_root
+  load_settings
+  require_command iptables
+
+  iptables_recover_staging_chain INPUT "$FW_INPUT_CHAIN" "$FW_INPUT_NEXT_CHAIN" || return 1
+  iptables_recover_staging_chain FORWARD "$FW_FORWARD_CHAIN" "$FW_FORWARD_NEXT_CHAIN" || return 1
+
+  iptables -w -N "$FW_INPUT_NEXT_CHAIN" || return 1
+  if ! iptables -w -N "$FW_FORWARD_NEXT_CHAIN"; then
+    iptables_delete_chain INPUT "$FW_INPUT_NEXT_CHAIN" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Klienci VPN nie mogą łączyć się z żadną usługą uruchomioną na Mikrusie,
+  # niezależnie od tego, na który adres serwera kierują pakiet.
+  if ! iptables -w -A "$FW_INPUT_NEXT_CHAIN" -i "$WG_IF" -s "$VPN_CIDR" \
+       -j REJECT --reject-with icmp-admin-prohibited; then
+    firewall_cleanup_staging
+    return 1
+  fi
+
+  # Publiczny port WireGuard. Reguła znajduje się po blokadzie ruchu z wg0.
+  if ! iptables -w -A "$FW_INPUT_NEXT_CHAIN" -p udp --dport "$WG_PORT" -j ACCEPT ||
+     ! iptables -w -A "$FW_INPUT_NEXT_CHAIN" -j RETURN; then
+    firewall_cleanup_staging
+    return 1
+  fi
+
+  # Zasady fail-closed są pierwsze: niezależnie od dalszych błędów Mikrus nie
+  # staje się bramą do Internetu ani wejściem do VPN z innych interfejsów.
+  if ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" ! -o "$WG_IF" \
+       -j REJECT --reject-with icmp-admin-prohibited ||
+     ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" ! -i "$WG_IF" -o "$WG_IF" \
+       -j REJECT --reject-with icmp-admin-prohibited; then
+    firewall_cleanup_staging
+    return 1
+  fi
+
+  # Pozwala członkom odpowiadać na połączenia zainicjowane przez administratorów.
+  if ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+       -s "$VPN_CIDR" -d "$VPN_CIDR" \
+       -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; then
+    firewall_cleanup_staging
+    return 1
+  fi
+
+  local client_dir role ip_addr name item proto port
+  local -a items
+  case "$POLICY" in
+    acl)
+      collect_client_dirs
+      for client_dir in "${CLIENT_DIRS[@]}"; do
+        name=$(basename "$client_dir")
+        validate_name "$name"
+        role=$(client_role "$client_dir")
+        [[ "$role" == "admin" ]] || continue
+        require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+        ip_addr=$(<"${client_dir}/ip")
+        validate_client_ip "$ip_addr"
+        if ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+             -s "${ip_addr}/32" -d "$VPN_CIDR" -j ACCEPT; then
+          iptables_delete_chain INPUT "$FW_INPUT_NEXT_CHAIN" >/dev/null 2>&1 || true
+          iptables_delete_chain FORWARD "$FW_FORWARD_NEXT_CHAIN" >/dev/null 2>&1 || true
+          return 1
+        fi
+      done
+      ;;
+    mesh)
+      iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+        -s "$VPN_CIDR" -d "$VPN_CIDR" -j ACCEPT || { firewall_cleanup_staging; return 1; }
+      ;;
+    rdp)
+      iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+        -s "$VPN_CIDR" -d "$VPN_CIDR" -p icmp -j ACCEPT || { firewall_cleanup_staging; return 1; }
+      iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+        -s "$VPN_CIDR" -d "$VPN_CIDR" -p tcp --dport 3389 -j ACCEPT || { firewall_cleanup_staging; return 1; }
+      iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+        -s "$VPN_CIDR" -d "$VPN_CIDR" -p udp --dport 3389 -j ACCEPT || { firewall_cleanup_staging; return 1; }
+      ;;
+    custom)
+      IFS=',' read -ra items <<<"$CUSTOM_PORTS"
+      for item in "${items[@]}"; do
+        if [[ "$item" == "icmp" ]]; then
+          iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+            -s "$VPN_CIDR" -d "$VPN_CIDR" -p icmp -j ACCEPT || { firewall_cleanup_staging; return 1; }
+        else
+          IFS=':' read -r proto port <<<"$item"
+          iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+            -s "$VPN_CIDR" -d "$VPN_CIDR" -p "$proto" --dport "$port" -j ACCEPT || { firewall_cleanup_staging; return 1; }
+        fi
+      done
+      ;;
+  esac
+
+  # Odrzuć każdy pozostały ruch między klientami.
+  if ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -i "$WG_IF" -o "$WG_IF" \
+       -j REJECT --reject-with icmp-admin-prohibited ||
+     ! iptables -w -A "$FW_FORWARD_NEXT_CHAIN" -j RETURN; then
+    firewall_cleanup_staging
+    return 1
+  fi
+
+  # Najpierw zbudowano kompletne nowe łańcuchy. Dopiero teraz są promowane.
+  iptables_promote_chain INPUT "$FW_INPUT_CHAIN" "$FW_INPUT_NEXT_CHAIN" || return 1
+  iptables_promote_chain FORWARD "$FW_FORWARD_CHAIN" "$FW_FORWARD_NEXT_CHAIN" || return 1
+}
+
+firewall_down() {
+  require_root
+  require_command iptables
+  local status=0
+  iptables_delete_chain INPUT "$FW_INPUT_NEXT_CHAIN" || status=1
+  iptables_delete_chain FORWARD "$FW_FORWARD_NEXT_CHAIN" || status=1
+  iptables_delete_chain INPUT "$FW_INPUT_CHAIN" || status=1
+  iptables_delete_chain FORWARD "$FW_FORWARD_CHAIN" || status=1
+  return "$status"
+}
+
+render_server_config() {
+  load_settings
+  local config private_key temp_file client_dir name public_key psk ip_addr index
+  local -a names=() public_keys=() preshared_keys=() ip_addresses=()
+  local -A seen_ips=() seen_public_keys=()
+
+  config=$(wg_config_path)
+  [[ ! -L "$config" && ! -d "$config" ]] || die "Niebezpieczna ścieżka konfiguracji serwera: $config"
+  require_secure_file "$SERVER_PRIVATE_KEY_FILE" "prywatny klucz serwera"
+  private_key=$(<"$SERVER_PRIVATE_KEY_FILE")
+  validate_wg_key "$private_key"
+
+  # Najpierw walidujemy cały stan. Dzięki temu błąd nie pozostawia częściowego
+  # pliku tymczasowego ani konfiguracji z pominiętym peerem.
+  collect_client_dirs
+  for client_dir in "${CLIENT_DIRS[@]}"; do
+    name=$(basename "$client_dir")
+    validate_name "$name"
+    require_secure_directory "$client_dir" "klient ${name}"
+    require_secure_file "${client_dir}/public.key" "klucz publiczny klienta ${name}"
+    require_secure_file "${client_dir}/preshared.key" "klucz PSK klienta ${name}"
+    require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+    public_key=$(<"${client_dir}/public.key")
+    psk=$(<"${client_dir}/preshared.key")
+    ip_addr=$(<"${client_dir}/ip")
+    validate_wg_key "$public_key"
+    validate_wg_key "$psk"
+    validate_client_ip "$ip_addr"
+    [[ -z ${seen_ips[$ip_addr]:-} ]] || die "Powtórzony adres klienta: ${ip_addr}."
+    [[ -z ${seen_public_keys[$public_key]:-} ]] || die "Powtórzony klucz publiczny klienta ${name}."
+    seen_ips[$ip_addr]=$name
+    seen_public_keys[$public_key]=$name
+    names+=("$name")
+    public_keys+=("$public_key")
+    preshared_keys+=("$psk")
+    ip_addresses+=("$ip_addr")
+  done
+
+  temp_file=$(mktemp "${config}.tmp.XXXXXX") || return 1
+  if ! cat >"$temp_file" <<EOF_WG
+# Zarządzane przez ${APP_NAME}. Nie edytuj ręcznie sekcji peerów.
+[Interface]
+Address = ${SERVER_VPN_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${private_key}
+SaveConfig = false
+PreUp = ${INSTALL_PATH} _firewall-up
+PostDown = ${INSTALL_PATH} _firewall-down
+EOF_WG
+  then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+
+  for index in "${!names[@]}"; do
+    if ! cat >>"$temp_file" <<EOF_PEER
+
+# Klient: ${names[$index]}
+[Peer]
+PublicKey = ${public_keys[$index]}
+PresharedKey = ${preshared_keys[$index]}
+AllowedIPs = ${ip_addresses[$index]}/32
+EOF_PEER
+    then
+      rm -f -- "$temp_file"
+      return 1
+    fi
+  done
+
+  if ! chmod 600 "$temp_file" || ! mv -f -- "$temp_file" "$config"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+sync_interface() {
+  load_settings
+  render_server_config || return 1
+  local config stripped
+  config=$(wg_config_path)
+
+  if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+    stripped=$(mktemp) || return 1
+    if ! wg-quick strip "$config" >"$stripped"; then
+      rm -f -- "$stripped"
+      return 1
+    fi
+    if ! wg syncconf "$WG_IF" "$stripped"; then
+      rm -f -- "$stripped"
+      return 1
+    fi
+    rm -f -- "$stripped"
+    firewall_up || return 1
+  else
+    systemctl start "wg-quick@${WG_IF}" || return 1
+  fi
+}
+
+next_client_ip() {
+  load_settings
+  collect_client_dirs
+  local n candidate client_dir name existing_ip
+  local -A used_ips=()
+  for client_dir in "${CLIENT_DIRS[@]}"; do
+    name=$(basename "$client_dir")
+    validate_name "$name"
+    require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+    existing_ip=$(<"${client_dir}/ip")
+    validate_client_ip "$existing_ip"
+    [[ -z ${used_ips[$existing_ip]:-} ]] || die "Powtórzony adres klienta: ${existing_ip}."
+    used_ips[$existing_ip]=$name
+  done
+  for ((n = 2; n <= 254; n++)); do
+    candidate="${NETWORK_BASE}.${n}"
+    if [[ -z ${used_ips[$candidate]:-} ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  die "Brak wolnych adresów w ${VPN_CIDR}."
+}
+
+default_role_for_ip() {
+  local ip_addr=$1 last_octet
+  load_settings
+  last_octet=${ip_addr##*.}
+  if (( last_octet >= 2 && last_octet <= ADMIN_SLOTS + 1 )); then
+    printf 'admin\n'
+  else
+    printf 'member\n'
+  fi
+}
+
+client_role() {
+  local client_dir=$1 ip_addr role name
+  name=$(basename "$client_dir")
+  validate_name "$name"
+  if [[ -e "${client_dir}/role" ]]; then
+    require_secure_file "${client_dir}/role" "rola klienta ${name}"
+    role=$(<"${client_dir}/role")
+    case "$role" in
+      admin|member) printf '%s\n' "$role" ;;
+      *) die "Nieprawidłowa rola w stanie klienta ${name}: $role" ;;
+    esac
+  else
+    require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+    ip_addr=$(<"${client_dir}/ip")
+    validate_client_ip "$ip_addr"
+    default_role_for_ip "$ip_addr"
+  fi
+}
+
+write_client_config() {
+  local name=$1 client_dir=$2 ip_addr=$3
+  load_settings
+  local private_key psk server_public endpoint_formatted config temp_file
+  validate_name "$name"
+  require_secure_directory "$client_dir" "klient ${name}"
+  require_secure_file "${client_dir}/private.key" "klucz prywatny klienta ${name}"
+  require_secure_file "${client_dir}/preshared.key" "klucz PSK klienta ${name}"
+  require_secure_file "$SERVER_PUBLIC_KEY_FILE" "klucz publiczny serwera"
+  private_key=$(<"${client_dir}/private.key")
+  psk=$(<"${client_dir}/preshared.key")
+  server_public=$(<"$SERVER_PUBLIC_KEY_FILE")
+  validate_wg_key "$private_key"
+  validate_wg_key "$psk"
+  validate_wg_key "$server_public"
+  validate_client_ip "$ip_addr"
+  endpoint_formatted=$(format_endpoint "$ENDPOINT")
+  config="${client_dir}/${name}.conf"
+  temp_file=$(mktemp "${config}.tmp.XXXXXX") || return 1
+
+  if ! cat >"$temp_file" <<EOF_CLIENT
+# Split-tunnel: tylko ${VPN_CIDR} przechodzi przez WireGuard.
+[Interface]
+PrivateKey = ${private_key}
+Address = ${ip_addr}/32
+
+[Peer]
+PublicKey = ${server_public}
+PresharedKey = ${psk}
+Endpoint = ${endpoint_formatted}:${WG_PORT}
+AllowedIPs = ${VPN_CIDR}
+PersistentKeepalive = ${KEEPALIVE}
+EOF_CLIENT
+  then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+  if ! chmod 600 "$temp_file" || ! mv -f -- "$temp_file" "$config"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+regenerate_all_client_configs() {
+  load_settings
+  local client_dir name ip_addr
+  collect_client_dirs
+  for client_dir in "${CLIENT_DIRS[@]}"; do
+    name=$(basename "$client_dir")
+    validate_name "$name"
+    require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+    ip_addr=$(<"${client_dir}/ip")
+    write_client_config "$name" "$client_dir" "$ip_addr" || return 1
+  done
+}
+
+add_client() {
+  require_root
+  local name=${1:-} requested_role=${2:-auto}
+  validate_name "$name"
+  validate_role "$requested_role"
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+
+  local client_dir="${CLIENTS_DIR}/${name}"
+  [[ ! -e "$client_dir" && ! -L "$client_dir" ]] || die "Klient '${name}' już istnieje albo jego ścieżka jest niebezpieczna."
+
+  local ip_addr role temp_dir
+  ip_addr=$(next_client_ip)
+  if [[ "$requested_role" == "auto" ]]; then
+    role=$(default_role_for_ip "$ip_addr")
+  else
+    role=$requested_role
+  fi
+
+  temp_dir=$(mktemp -d "${CLIENTS_DIR}/.${name}.tmp.XXXXXX")
+  chmod 700 "$temp_dir"
+
+  if ! {
+    wg genkey >"${temp_dir}/private.key" &&
+      wg pubkey <"${temp_dir}/private.key" >"${temp_dir}/public.key" &&
+      wg genpsk >"${temp_dir}/preshared.key" &&
+      printf '%s\n' "$ip_addr" >"${temp_dir}/ip" &&
+      printf '%s\n' "$role" >"${temp_dir}/role"
+  }; then
+    rm -rf -- "$temp_dir"
+    die "Nie udało się wygenerować kluczy klienta '${name}'."
+  fi
+  chmod 600 "$temp_dir"/*
+
+  if ! (write_client_config "$name" "$temp_dir" "$ip_addr"); then
+    rm -rf -- "$temp_dir"
+    die "Nie udało się utworzyć profilu klienta '${name}'."
+  fi
+
+  if ! mv -- "$temp_dir" "$client_dir"; then
+    rm -rf -- "$temp_dir"
+    die "Nie udało się zatwierdzić katalogu klienta '${name}'."
+  fi
+
+  if ! (sync_interface); then
+    warn "Synchronizacja nie powiodła się; wycofuję dodanie klienta '${name}'."
+    rm -rf -- "$client_dir"
+    if ! (sync_interface); then
+      warn "Nie udało się automatycznie odtworzyć poprzedniej konfiguracji. Uruchom: sudo ${APP_NAME} restart"
+    fi
+    die "Nie dodano klienta '${name}'."
+  fi
+
+  release_lock
+  ok "Dodano klienta '${name}' z adresem ${ip_addr} i rolą ${role}."
+  printf 'Profil: %s\n' "${client_dir}/${name}.conf"
+  printf 'QR:     sudo %s qr %s\n' "$APP_NAME" "$name"
+}
+
+remove_client() {
+  require_root
+  local name=${1:-}
+  validate_name "$name"
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+
+  local client_dir="${CLIENTS_DIR}/${name}" rollback_dir
+  require_secure_directory "$client_dir" "klient ${name}"
+
+  rollback_dir=$(mktemp -d "${CLIENTS_DIR}/.remove-${name}.XXXXXX") || die "Nie udało się utworzyć katalogu wycofania."
+  chmod 700 "$rollback_dir"
+  if ! mv -- "$client_dir" "${rollback_dir}/${name}"; then
+    rmdir -- "$rollback_dir" 2>/dev/null || true
+    die "Nie udało się rozpocząć bezpiecznego usuwania klienta '${name}'."
+  fi
+
+  if ! (sync_interface); then
+    warn "Synchronizacja nie powiodła się; przywracam klienta '${name}'."
+    mv -- "${rollback_dir}/${name}" "$client_dir"
+    rmdir "$rollback_dir" 2>/dev/null || true
+    if ! (sync_interface); then
+      warn "Nie udało się automatycznie odtworzyć aktywnej konfiguracji. Uruchom: sudo ${APP_NAME} restart"
+    fi
+    die "Nie usunięto klienta '${name}'."
+  fi
+
+  rm -rf -- "$rollback_dir"
+  release_lock
+  ok "Usunięto klienta '${name}' i jego klucze."
+}
+
+write_client_role() {
+  local client_dir=$1 role=$2 temp_file
+  temp_file=$(mktemp "${client_dir}/.role.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$role" >"$temp_file" ||
+     ! chmod 600 "$temp_file" ||
+     ! mv -f -- "$temp_file" "${client_dir}/role"; then
+    rm -f -- "$temp_file"
+    return 1
+  fi
+}
+
+set_client_role() {
+  require_root
+  local name=${1:-} role=${2:-}
+  validate_name "$name"
+  validate_role "$role"
+  [[ "$role" != "auto" ]] || die "Polecenie set-role wymaga roli admin albo member."
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+
+  local client_dir="${CLIENTS_DIR}/${name}" old_role
+  require_secure_directory "$client_dir" "klient ${name}"
+  old_role=$(client_role "$client_dir")
+
+  if ! (write_client_role "$client_dir" "$role" && firewall_up); then
+    write_client_role "$client_dir" "$old_role"
+    (firewall_up) || warn "Nie udało się automatycznie odtworzyć poprzednich reguł firewalla."
+    die "Nie zmieniono roli klienta '${name}'."
+  fi
+
+  release_lock
+  ok "Klient '${name}' ma teraz rolę ${role}."
+}
+
+human_bytes() {
+  local bytes=${1:-0}
+  [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+  awk -v b="$bytes" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GiB", b/1073741824;
+    else if (b >= 1048576) printf "%.1f MiB", b/1048576;
+    else if (b >= 1024) printf "%.1f KiB", b/1024;
+    else printf "%.0f B", b;
+  }'
+}
+
+list_clients() {
+  require_root
+  load_settings
+  printf '%-24s %-15s %-9s %-19s %-12s %-12s\n' "NAZWA" "ADRES VPN" "ROLA" "HANDSHAKE" "ODEBRANO" "WYSŁANO"
+  printf '%-24s %-15s %-9s %-19s %-12s %-12s\n' "------------------------" "---------------" "---------" "-------------------" "------------" "------------"
+
+  local client_dir name ip_addr role public_key handshake rx tx transfer_line
+  collect_client_dirs
+  for client_dir in "${CLIENT_DIRS[@]}"; do
+    name=$(basename "$client_dir")
+    validate_name "$name"
+    require_secure_file "${client_dir}/ip" "adres IP klienta ${name}"
+    require_secure_file "${client_dir}/public.key" "klucz publiczny klienta ${name}"
+    ip_addr=$(<"${client_dir}/ip")
+    validate_client_ip "$ip_addr"
+    role=$(client_role "$client_dir")
+    public_key=$(<"${client_dir}/public.key")
+    validate_wg_key "$public_key"
+    handshake="-" rx="0" tx="0"
+
+    if ip link show "$WG_IF" >/dev/null 2>&1; then
+      handshake=$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk -v key="$public_key" '$1 == key {print $2}')
+      transfer_line=$(wg show "$WG_IF" transfer 2>/dev/null | awk -v key="$public_key" '$1 == key {print $2 " " $3}')
+      IFS=' ' read -r rx tx <<<"${transfer_line:-0 0}"
+      [[ "$rx" =~ ^[0-9]+$ ]] || rx=0
+      [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+      if [[ "$handshake" =~ ^[1-9][0-9]*$ ]]; then
+        handshake=$(date -d "@${handshake}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$handshake")
+      else
+        handshake="-"
+      fi
+    fi
+
+    printf '%-24s %-15s %-9s %-19s %-12s %-12s\n' \
+      "$name" "$ip_addr" "$role" "$handshake" "$(human_bytes "$rx")" "$(human_bytes "$tx")"
+  done
+}
+
+client_config_path() {
+  local name=$1
+  printf '%s/%s/%s.conf' "$CLIENTS_DIR" "$name" "$name"
+}
+
+show_client() {
+  require_root
+  local name=${1:-} config
+  validate_name "$name"
+  config=$(client_config_path "$name")
+  require_secure_file "$config" "profil klienta ${name}"
+  cat "$config"
+}
+
+qr_client() {
+  require_root
+  local name=${1:-} config
+  validate_name "$name"
+  require_command qrencode
+  config=$(client_config_path "$name")
+  require_secure_file "$config" "profil klienta ${name}"
+  qrencode -t ansiutf8 <"$config"
+}
+
+export_client() {
+  require_root
+  local name=${1:-} destination=${2:-} config
+  validate_name "$name"
+  config=$(client_config_path "$name")
+  require_secure_file "$config" "profil klienta ${name}"
+  destination=${destination:-"./${name}.conf"}
+  [[ ! -L "$destination" ]] || die "Docelowy plik jest dowiązaniem symbolicznym: $destination"
+  [[ ! -d "$destination" ]] || die "Docelowa ścieżka jest katalogiem: $destination"
+  atomic_install_file "$config" "$destination" 0600 || die "Nie udało się bezpiecznie zapisać profilu: $destination"
+  ok "Zapisano profil w: $destination"
+  warn "Profil zawiera klucz prywatny. Przekaż go bezpiecznym kanałem i nie dodawaj do Git."
+}
+
+show_status() {
+  require_root
+  load_settings
+  printf 'Interfejs:       %s\n' "$WG_IF"
+  printf 'Endpoint:        %s:%s/UDP\n' "$ENDPOINT" "$WG_PORT"
+  printf 'Podsieć VPN:     %s\n' "$VPN_CIDR"
+  printf 'Polityka:        %s\n' "$POLICY"
+  printf 'Sloty adminów:   %s\n' "$ADMIN_SLOTS"
+  [[ -n "$MIKRUS_ID" ]] && printf 'ID Mikrusa:      %s\n' "$MIKRUS_ID"
+  [[ -n "$CUSTOM_PORTS" ]] && printf 'Reguły custom:   %s\n' "$CUSTOM_PORTS"
+  printf 'Dostęp do VPS:   zablokowany od strony VPN\n'
+  printf 'Split-tunnel:    tak; brak NAT/MASQUERADE\n\n'
+  systemctl --no-pager --full status "wg-quick@${WG_IF}" || true
+  printf '\n'
+  wg show "$WG_IF" || true
+}
+
+doctor() {
+  require_root
+  load_settings
+  local failures=0 config nat_rules="" value
+  config=$(wg_config_path)
+
+  doctor_check() {
+    local description=$1
+    shift
+    if ("$@" >/dev/null 2>&1); then
+      printf '[OK]    %s\n' "$description"
+    else
+      printf '[BŁĄD]  %s\n' "$description"
+      failures=$((failures + 1))
+    fi
+  }
+
+  doctor_check "systemd działa" systemctl show-environment
+  doctor_check "interfejs ${WG_IF} istnieje" ip link show "$WG_IF"
+  doctor_check "usługa wg-quick jest aktywna" systemctl is-active --quiet "wg-quick@${WG_IF}"
+  doctor_check "zainstalowany program jest zwykłym plikiem roota" require_root_file "$INSTALL_PATH" "program ${APP_NAME}"
+  doctor_check "zainstalowany program jest wykonywalny" test -x "$INSTALL_PATH"
+  doctor_check "konfiguracja serwera jest bezpieczna" require_secure_file "$config" "konfiguracja serwera"
+  doctor_check "plik sysctl jest zwykłym plikiem roota" require_root_file "$SYSCTL_FILE" "konfiguracja sysctl"
+  doctor_check "plik sysctl włącza przekazywanie IPv4" grep -Eq '^net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$SYSCTL_FILE"
+  doctor_check "IPv4 forwarding jest włączony" test "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1"
+
+  if (require_secure_file "$SERVER_PRIVATE_KEY_FILE" "prywatny klucz serwera") >/dev/null 2>&1; then
+    value=$(<"$SERVER_PRIVATE_KEY_FILE")
+    doctor_check "prywatny klucz serwera ma poprawny format" validate_wg_key "$value"
+  else
+    printf '[BŁĄD]  prywatny klucz serwera nie jest bezpiecznym plikiem\n'
+    failures=$((failures + 1))
+  fi
+  if (require_secure_file "$SERVER_PUBLIC_KEY_FILE" "publiczny klucz serwera") >/dev/null 2>&1; then
+    value=$(<"$SERVER_PUBLIC_KEY_FILE")
+    doctor_check "publiczny klucz serwera ma poprawny format" validate_wg_key "$value"
+  else
+    printf '[BŁĄD]  publiczny klucz serwera nie jest bezpiecznym plikiem\n'
+    failures=$((failures + 1))
+  fi
+
+  doctor_check "łańcuch INPUT jest podłączony" iptables -w -C INPUT -j "$FW_INPUT_CHAIN"
+  doctor_check "łańcuch FORWARD jest podłączony" iptables -w -C FORWARD -j "$FW_FORWARD_CHAIN"
+  doctor_check "port UDP jest otwarty w regułach" iptables -w -C "$FW_INPUT_CHAIN" -p udp --dport "$WG_PORT" -j ACCEPT
+  doctor_check "dostęp klientów do samego VPS jest zablokowany" iptables -w -C "$FW_INPUT_CHAIN" -i "$WG_IF" -s "$VPN_CIDR" -j REJECT --reject-with icmp-admin-prohibited
+  doctor_check "blokada wyjścia z VPN jest aktywna" iptables -w -C "$FW_FORWARD_CHAIN" -i "$WG_IF" ! -o "$WG_IF" -j REJECT --reject-with icmp-admin-prohibited
+  doctor_check "blokada wejścia do VPN z innych interfejsów jest aktywna" iptables -w -C "$FW_FORWARD_CHAIN" ! -i "$WG_IF" -o "$WG_IF" -j REJECT --reject-with icmp-admin-prohibited
+
+  local client_dir role name public_key private_key psk ip_addr path config_allowed nullglob_was_set=0
+  local -A seen_ips=() seen_public_keys=() seen_psks=()
+  shopt -q nullglob && nullglob_was_set=1
+  shopt -s nullglob
+  for client_dir in "$CLIENTS_DIR"/*; do
+    if [[ ! -d "$client_dir" || -L "$client_dir" ]]; then
+      printf '[BŁĄD]  niebezpieczny wpis w katalogu klientów: %s\n' "$client_dir"
+      failures=$((failures + 1))
+      continue
+    fi
+    name=$(basename "$client_dir")
+    if ! (validate_name "$name") >/dev/null 2>&1; then
+      printf '[BŁĄD]  nieprawidłowa nazwa katalogu klienta: %q\n' "$name"
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! (require_secure_directory "$client_dir" "klient ${name}") >/dev/null 2>&1; then
+      printf '[BŁĄD]  niebezpieczne uprawnienia katalogu klienta %s\n' "$name"
+      failures=$((failures + 1))
+    fi
+
+    if ! role=$(client_role "$client_dir" 2>/dev/null); then
+      printf '[BŁĄD]  nie można odczytać roli klienta %s\n' "$name"
+      failures=$((failures + 1))
+    elif [[ "$role" != "admin" && "$role" != "member" ]]; then
+      printf '[BŁĄD]  nieprawidłowa rola klienta %s: %s\n' "$name" "$role"
+      failures=$((failures + 1))
+    fi
+
+    if (require_secure_file "${client_dir}/ip" "adres IP klienta ${name}") >/dev/null 2>&1; then
+      ip_addr=$(<"${client_dir}/ip")
+      if ! (validate_client_ip "$ip_addr") >/dev/null 2>&1; then
+        printf '[BŁĄD]  nieprawidłowy adres klienta %s\n' "$name"
+        failures=$((failures + 1))
+      elif [[ -n ${seen_ips[$ip_addr]:-} ]]; then
+        printf '[BŁĄD]  adres %s jest przypisany klientom %s i %s\n' "$ip_addr" "${seen_ips[$ip_addr]}" "$name"
+        failures=$((failures + 1))
+      else
+        seen_ips[$ip_addr]=$name
+      fi
+    else
+      printf '[BŁĄD]  brak bezpiecznego pliku IP klienta %s\n' "$name"
+      failures=$((failures + 1))
+    fi
+
+    if (require_secure_file "${client_dir}/public.key" "klucz publiczny klienta ${name}") >/dev/null 2>&1; then
+      public_key=$(<"${client_dir}/public.key")
+      if ! (validate_wg_key "$public_key") >/dev/null 2>&1; then
+        printf '[BŁĄD]  nieprawidłowy klucz publiczny klienta %s\n' "$name"
+        failures=$((failures + 1))
+      elif [[ -n ${seen_public_keys[$public_key]:-} ]]; then
+        printf '[BŁĄD]  klucz publiczny jest współdzielony przez klientów %s i %s\n' "${seen_public_keys[$public_key]}" "$name"
+        failures=$((failures + 1))
+      else
+        seen_public_keys[$public_key]=$name
+      fi
+    else
+      printf '[BŁĄD]  brak bezpiecznego klucza publicznego klienta %s\n' "$name"
+      failures=$((failures + 1))
+    fi
+
+    for path in private.key preshared.key role "${name}.conf"; do
+      if ! (require_secure_file "${client_dir}/${path}" "${path} klienta ${name}") >/dev/null 2>&1; then
+        printf '[BŁĄD]  brak bezpiecznego pliku %s klienta %s\n' "$path" "$name"
+        failures=$((failures + 1))
+      fi
+    done
+
+    if [[ -f "${client_dir}/private.key" && ! -L "${client_dir}/private.key" ]]; then
+      private_key=$(<"${client_dir}/private.key")
+      if ! (validate_wg_key "$private_key") >/dev/null 2>&1; then
+        printf '[BŁĄD]  nieprawidłowy klucz prywatny klienta %s\n' "$name"
+        failures=$((failures + 1))
+      fi
+    fi
+    if [[ -f "${client_dir}/preshared.key" && ! -L "${client_dir}/preshared.key" ]]; then
+      psk=$(<"${client_dir}/preshared.key")
+      if ! (validate_wg_key "$psk") >/dev/null 2>&1; then
+        printf '[BŁĄD]  nieprawidłowy klucz PSK klienta %s\n' "$name"
+        failures=$((failures + 1))
+      elif [[ -n ${seen_psks[$psk]:-} ]]; then
+        printf '[BŁĄD]  klucz PSK jest współdzielony przez klientów %s i %s\n' "${seen_psks[$psk]}" "$name"
+        failures=$((failures + 1))
+      else
+        seen_psks[$psk]=$name
+      fi
+    fi
+    if [[ -f "${client_dir}/${name}.conf" && ! -L "${client_dir}/${name}.conf" ]]; then
+      config_allowed=$(grep -Ec '^[[:space:]]*AllowedIPs[[:space:]]*=' "${client_dir}/${name}.conf" || true)
+      if [[ "$config_allowed" != "1" ]] ||
+         ! grep -Fqx "AllowedIPs = ${VPN_CIDR}" "${client_dir}/${name}.conf"; then
+        printf '[BŁĄD]  profil klienta %s nie ma dokładnie AllowedIPs = %s\n' "$name" "$VPN_CIDR"
+        failures=$((failures + 1))
+      fi
+    fi
+  done
+  (( nullglob_was_set == 1 )) || shopt -u nullglob
+
+  if find "$CLIENTS_DIR" -mindepth 1 -maxdepth 1 -name '.*' -print -quit | grep -q .; then
+    printf '[BŁĄD]  wykryto niedokończony wpis transakcyjny w %s\n' "$CLIENTS_DIR"
+    failures=$((failures + 1))
+  else
+    printf '[OK]    brak niedokończonych wpisów transakcyjnych\n'
+  fi
+
+  if command -v iptables-save >/dev/null 2>&1; then
+    nat_rules=$(iptables-save -t nat 2>/dev/null || true)
+    if grep -Eq -- "^-A .*${VPN_CIDR//./\\.}.*-j (MASQUERADE|SNAT|DNAT)([[:space:]]|$)" <<<"$nat_rules"; then
+      printf '[BŁĄD]  wykryto regułę NAT związaną z podsiecią VPN\n'
+      failures=$((failures + 1))
+    else
+      printf '[OK]    brak NAT dla podsieci VPN\n'
+    fi
+  else
+    printf '[BŁĄD]  brak polecenia iptables-save\n'
+    failures=$((failures + 1))
+  fi
+
+  local staging_chain
+  for staging_chain in "$FW_INPUT_NEXT_CHAIN" "$FW_FORWARD_NEXT_CHAIN"; do
+    if iptables_chain_exists "$staging_chain"; then
+      printf '[BŁĄD]  pozostał przejściowy łańcuch firewalla %s\n' "$staging_chain"
+      failures=$((failures + 1))
+    else
+      printf '[OK]    brak przejściowego łańcucha firewalla %s\n' "$staging_chain"
+    fi
+  done
+
+  unset -f doctor_check
+  (( failures == 0 )) || die "Diagnostyka wykryła ${failures} problem(y)."
+  ok "Diagnostyka zakończona bez błędów."
+}
+
+restart_service_unlocked() {
+  load_settings
+  render_server_config || return 1
+  systemctl restart "wg-quick@${WG_IF}"
+}
+
+restart_service() {
+  require_root
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+  restart_service_unlocked
+  release_lock
+  ok "Zrestartowano WireGuard."
+}
+
+set_endpoint() {
+  require_root
+  local endpoint=${1:-} port=${2:-}
+  validate_endpoint "$endpoint"
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+
+  local old_endpoint=$ENDPOINT old_port=$WG_PORT new_port=$WG_PORT
+  if [[ -n "$port" ]]; then
+    validate_port "$port"
+    new_port=$((10#$port))
+  fi
+  if (( new_port != old_port )); then
+    if ss -H -lun "sport = :${new_port}" 2>/dev/null | grep -q .; then
+      die "Port UDP ${new_port} jest już używany. Nie zmieniono konfiguracji."
+    fi
+  fi
+
+  ENDPOINT=$endpoint
+  WG_PORT=$new_port
+  if [[ -n "$MIKRUS_ID" ]]; then
+    local expected_20 expected_30
+    expected_20=$((20000 + 10#$MIKRUS_ID))
+    expected_30=$((30000 + 10#$MIKRUS_ID))
+    if (( WG_PORT != expected_20 && WG_PORT != expected_30 )); then
+      warn "Port ${WG_PORT} nie odpowiada portom UDP Mikrusa ${expected_20} ani ${expected_30}."
+    fi
+  fi
+
+  if ! (write_settings && regenerate_all_client_configs && restart_service_unlocked); then
+    warn "Restart po zmianie endpointu nie powiódł się; przywracam poprzednie ustawienia."
+    ENDPOINT=$old_endpoint
+    WG_PORT=$old_port
+    write_settings
+    regenerate_all_client_configs
+    (restart_service_unlocked) || warn "Nie udało się automatycznie uruchomić poprzedniej konfiguracji."
+    die "Nie zmieniono endpointu."
+  fi
+
+  release_lock
+  ok "Zmieniono endpoint na ${ENDPOINT}:${WG_PORT}/UDP. Wyeksportuj profile klientów ponownie."
+}
+
+set_policy() {
+  require_root
+  local policy=${1:-} rules=${2:-}
+  validate_policy "$policy"
+  if [[ "$policy" == "custom" ]]; then
+    validate_custom_ports "$rules"
+  else
+    rules=""
+  fi
+  acquire_lock
+  load_settings
+  ensure_no_pending_transactions
+
+  local old_policy=$POLICY old_rules=$CUSTOM_PORTS
+  POLICY=$policy
+  CUSTOM_PORTS=$rules
+  if ! (write_settings && firewall_up); then
+    POLICY=$old_policy
+    CUSTOM_PORTS=$old_rules
+    write_settings
+    (firewall_up) || warn "Nie udało się automatycznie odtworzyć poprzednich reguł firewalla."
+    die "Nie zmieniono polityki ruchu."
+  fi
+
+  release_lock
+  ok "Ustawiono politykę ruchu: ${POLICY}."
+}
+
+backup_state() {
+  require_root
+  acquire_lock
+  load_settings
+
+  local destination
+  local state_rel config config_rel sysctl_rel absolute_destination parent_input parent base temp_archive
+  destination=${1:-"/root/mikrus-wg-backup-$(date +%Y%m%d-%H%M%S).tar.gz"}
+  local state_real wireguard_real client_dir name path
+
+  state_rel=${STATE_DIR#/}
+  config=$(wg_config_path)
+  config_rel=${config#/}
+  sysctl_rel=${SYSCTL_FILE#/}
+
+  require_secure_file "$SERVER_PRIVATE_KEY_FILE" "prywatny klucz serwera"
+  require_secure_file "$SERVER_PUBLIC_KEY_FILE" "publiczny klucz serwera"
+  require_secure_file "$config" "konfiguracja serwera"
+  require_root_file "$SYSCTL_FILE" "konfiguracja sysctl"
+  collect_client_dirs
+  for client_dir in "${CLIENT_DIRS[@]}"; do
+    name=$(basename "$client_dir")
+    validate_name "$name"
+    require_secure_directory "$client_dir" "klient ${name}"
+    for path in private.key public.key preshared.key ip role "${name}.conf"; do
+      require_secure_file "${client_dir}/${path}" "${path} klienta ${name}"
+    done
+  done
+
+  [[ ! -L "$destination" ]] || die "Docelowy plik kopii jest dowiązaniem symbolicznym: $destination"
+  [[ ! -d "$destination" ]] || die "Docelowa ścieżka kopii jest katalogiem: $destination"
+  parent_input=$(dirname -- "$destination")
+  base=$(basename -- "$destination")
+  [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || die "Nieprawidłowa nazwa pliku kopii."
+  parent=$(readlink -f -- "$parent_input") || die "Nie można ustalić katalogu docelowego kopii."
+  [[ -d "$parent" ]] || die "Katalog docelowy kopii nie istnieje: $parent"
+  absolute_destination="${parent}/${base}"
+  state_real=$(readlink -f -- "$STATE_DIR")
+  wireguard_real=$(readlink -f -- "$WIREGUARD_DIR")
+  case "$absolute_destination" in
+    "$state_real"|"$state_real"/*|"$wireguard_real"|"$wireguard_real"/*)
+      die "Kopia nie może być zapisana wewnątrz katalogów objętych archiwizacją."
+      ;;
+  esac
+
+  temp_archive=$(mktemp "${parent}/.${base}.tmp.XXXXXX") || die "Nie udało się utworzyć pliku tymczasowego kopii."
+  if ! tar -czf "$temp_archive" -C / "$state_rel" "$config_rel" "$sysctl_rel"; then
+    rm -f -- "$temp_archive"
+    die "Nie udało się utworzyć kopii zapasowej."
+  fi
+  if ! chmod 600 "$temp_archive" || ! mv -f -- "$temp_archive" "$absolute_destination"; then
+    rm -f -- "$temp_archive"
+    die "Nie udało się zatwierdzić kopii zapasowej."
+  fi
+  release_lock
+  ok "Utworzono niezaszyfrowaną kopię: $absolute_destination"
+  warn "Kopia zawiera wszystkie klucze prywatne. Zaszyfruj ją przed przeniesieniem poza serwer."
+}
+
+self_update() {
+  require_root
+  acquire_lock
+  load_settings
+  validate_repository "$SOURCE_REPOSITORY"
+  validate_ref "$SOURCE_REF"
+  local command
+  for command in curl sha256sum stat awk grep bash mktemp install; do
+    require_command "$command"
+  done
+
+  local base_url source_url checksum_url source_tmp checksum_tmp manifest_line expected actual size
+  base_url="https://raw.githubusercontent.com/${SOURCE_REPOSITORY}/${SOURCE_REF}/src"
+  source_url="${base_url}/mikrus-wg"
+  checksum_url="${base_url}/mikrus-wg.sha256"
+  source_tmp=$(mktemp) || die "Nie udało się utworzyć pliku tymczasowego aktualizacji."
+  checksum_tmp=$(mktemp) || {
+    rm -f -- "$source_tmp"
+    die "Nie udało się utworzyć pliku tymczasowego sumy kontrolnej."
+  }
+
+  if ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$source_url" --output "$source_tmp" ||
+     ! curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$checksum_url" --output "$checksum_tmp"; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Nie udało się pobrać aktualizacji albo jej sumy kontrolnej."
+  fi
+
+  size=$(stat -c '%s' "$source_tmp")
+  (( size > 0 && size <= 1048576 )) || {
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Pobrany program ma nieprawidłowy rozmiar."
+  }
+  [[ $(stat -c '%s' "$checksum_tmp") -le 256 ]] || {
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Plik sumy kontrolnej jest zbyt duży."
+  }
+
+  manifest_line=$(<"$checksum_tmp")
+  if [[ ! "$manifest_line" =~ ^([a-f0-9]{64})[[:space:]][[:space:]]mikrus-wg$ ]]; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Nieprawidłowy format sumy kontrolnej aktualizacji."
+  fi
+  expected=${BASH_REMATCH[1]}
+  actual=$(sha256sum "$source_tmp" | awk '{print $1}')
+  if [[ "$actual" != "$expected" ]]; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Suma SHA-256 aktualizacji nie zgadza się."
+  fi
+  if ! bash -n "$source_tmp"; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Pobrana aktualizacja ma nieprawidłową składnię Bash."
+  fi
+  if ! grep -Fqx 'readonly APP_NAME="mikrus-wg"' "$source_tmp" ||
+     ! grep -Eq '^readonly VERSION="[0-9]+\.[0-9]+\.[0-9]+"$' "$source_tmp"; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Pobrany plik nie wygląda jak poprawna wersja mikrus-wg."
+  fi
+  if ! atomic_install_file "$source_tmp" "$INSTALL_PATH" 0755; then
+    rm -f -- "$source_tmp" "$checksum_tmp"
+    die "Nie udało się atomowo zainstalować pobranej aktualizacji."
+  fi
+
+  rm -f -- "$source_tmp" "$checksum_tmp"
+  release_lock
+  ok "Zaktualizowano ${APP_NAME} z ${SOURCE_REPOSITORY}@${SOURCE_REF}."
+  "$INSTALL_PATH" version
+}
+
+install_server() {
+  require_root
+
+  local endpoint="$DEFAULT_ENDPOINT" port="" mikrus_id="$DEFAULT_MIKRUS_ID"
+  local first_client="admin-1" create_client=1
+  local network_base="10.77.77" interface="wg0" policy="acl" custom_ports=""
+  local keepalive="25" admin_slots="5"
+  local repository=${MIKRUS_WG_SOURCE_REPOSITORY:-$DEFAULT_REPOSITORY}
+  local ref=${MIKRUS_WG_SOURCE_REF:-main}
+
+  shift || true
+  while (($#)); do
+    case "$1" in
+      --mikrus-id) [[ $# -ge 2 ]] || die "Brak wartości po --mikrus-id."; mikrus_id=$2; shift 2 ;;
+      --endpoint) [[ $# -ge 2 ]] || die "Brak wartości po --endpoint."; endpoint=$2; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || die "Brak wartości po --port."; port=$2; shift 2 ;;
+      --client) [[ $# -ge 2 ]] || die "Brak wartości po --client."; first_client=$2; create_client=1; shift 2 ;;
+      --no-client) create_client=0; shift ;;
+      --network) [[ $# -ge 2 ]] || die "Brak wartości po --network."; network_base=$2; shift 2 ;;
+      --interface) [[ $# -ge 2 ]] || die "Brak wartości po --interface."; interface=$2; shift 2 ;;
+      --policy) [[ $# -ge 2 ]] || die "Brak wartości po --policy."; policy=$2; shift 2 ;;
+      --admin-slots) [[ $# -ge 2 ]] || die "Brak wartości po --admin-slots."; admin_slots=$2; shift 2 ;;
+      --allowed-ports) [[ $# -ge 2 ]] || die "Brak wartości po --allowed-ports."; custom_ports=$2; shift 2 ;;
+      --keepalive) [[ $# -ge 2 ]] || die "Brak wartości po --keepalive."; keepalive=$2; shift 2 ;;
+      --repository) [[ $# -ge 2 ]] || die "Brak wartości po --repository."; repository=$2; shift 2 ;;
+      --ref) [[ $# -ge 2 ]] || die "Brak wartości po --ref."; ref=$2; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Nieznana opcja instalacji: $1" ;;
+    esac
+  done
+
+  acquire_lock
+  [[ ! -e "$SETTINGS_FILE" && ! -L "$SETTINGS_FILE" ]] ||
+    die "${APP_NAME} jest już skonfigurowany albo ścieżka ustawień jest niebezpieczna."
+  [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]] ||
+    die "Katalog ${STATE_DIR} już istnieje. Sprawdź go i usuń ręcznie dopiero po wykonaniu kopii."
+  [[ ! -e "$SYSCTL_FILE" && ! -L "$SYSCTL_FILE" ]] ||
+    die "Plik ${SYSCTL_FILE} już istnieje albo jest dowiązaniem. Instalator niczego nie nadpisał."
+  [[ ! -L "$INSTALL_PATH" && ! -d "$INSTALL_PATH" ]] ||
+    die "Ścieżka programu jest niebezpieczna: ${INSTALL_PATH}"
+
+  [[ -n "$mikrus_id" ]] || die "ID Mikrusa nie może być puste."
+  validate_mikrus_id "$mikrus_id"
+  mikrus_id=$((10#$mikrus_id))
+
+  if [[ -z "$port" ]]; then
+    port=$((20000 + mikrus_id))
+  fi
+
+  validate_endpoint "$endpoint"
+  validate_port "$port"
+  validate_network_base "$network_base"
+  validate_interface "$interface"
+  validate_policy "$policy"
+  validate_keepalive "$keepalive"
+  validate_admin_slots "$admin_slots"
+  (( create_client == 0 )) || validate_name "$first_client"
+  if [[ "$policy" == "custom" ]]; then
+    validate_custom_ports "$custom_ports"
+  else
+    custom_ports=""
+  fi
+  validate_repository "$repository"
+  validate_ref "$ref"
+
+  port=$((10#$port))
+  keepalive=$((10#$keepalive))
+  admin_slots=$((10#$admin_slots))
+
+  local expected_20 expected_30
+  expected_20=$((20000 + mikrus_id))
+  expected_30=$((30000 + mikrus_id))
+  if (( port != expected_20 && port != expected_30 )); then
+    warn "Port ${port} nie odpowiada 20000+ID (${expected_20}) ani 30000+ID (${expected_30})."
+  fi
+
+  local target_config="${WIREGUARD_DIR}/${interface}.conf"
+  local wireguard_dir_existed=0 wireguard_dir_mode=""
+  if [[ -e "$WIREGUARD_DIR" || -L "$WIREGUARD_DIR" ]]; then
+    require_root_directory "$WIREGUARD_DIR" "katalog WireGuard"
+    wireguard_dir_existed=1
+    wireguard_dir_mode=$(stat -c '%a' "$WIREGUARD_DIR")
+  fi
+  [[ ! -e "$target_config" && ! -L "$target_config" ]] ||
+    die "Plik ${target_config} już istnieje albo jest dowiązaniem. Instalator niczego nie nadpisał."
+
+  check_systemd
+  install_packages
+  check_install_conflicts "$interface" "$port"
+  check_wireguard_capability
+
+  ENDPOINT=$endpoint
+  WG_PORT=$port
+  MIKRUS_ID=$mikrus_id
+  NETWORK_BASE=$network_base
+  VPN_CIDR="${network_base}.0/24"
+  SERVER_VPN_IP="${network_base}.1"
+  WG_IF=$interface
+  POLICY=$policy
+  ADMIN_SLOTS=$admin_slots
+  CUSTOM_PORTS=$custom_ports
+  KEEPALIVE=$keepalive
+  SOURCE_REPOSITORY=$repository
+  SOURCE_REF=$ref
+  ORIGINAL_IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf '0')
+  [[ "$ORIGINAL_IP_FORWARD" == "0" || "$ORIGINAL_IP_FORWARD" == "1" ]] ||
+    die "Nieprawidłowa bieżąca wartość net.ipv4.ip_forward: ${ORIGINAL_IP_FORWARD}"
+
+  local previous_binary=""
+  if [[ -e "$INSTALL_PATH" ]]; then
+    require_root_file "$INSTALL_PATH" "istniejący program ${APP_NAME}"
+    previous_binary=$(mktemp) || die "Nie udało się przygotować kopii poprzedniego programu."
+    cp -a -- "$INSTALL_PATH" "$previous_binary"
+  fi
+
+  if ! (
+    ensure_installed_self &&
+    write_settings &&
+    generate_server_keys &&
+    configure_forwarding &&
+    render_server_config &&
+    systemctl enable "wg-quick@${WG_IF}" >/dev/null &&
+    systemctl start "wg-quick@${WG_IF}"
+  ); then
+    warn "Instalacja nie powiodła się; wycofuję utworzoną konfigurację."
+    journalctl -u "wg-quick@${WG_IF}" --no-pager -n 80 >&2 || true
+    systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+    (firewall_down) >/dev/null 2>&1 || true
+    rm -f -- "$target_config" "$SYSCTL_FILE"
+    rm -rf -- "$STATE_DIR"
+    if (( wireguard_dir_existed == 1 )); then
+      chmod "$wireguard_dir_mode" "$WIREGUARD_DIR" >/dev/null 2>&1 ||
+        warn "Nie udało się przywrócić uprawnień katalogu ${WIREGUARD_DIR}."
+    else
+      rmdir -- "$WIREGUARD_DIR" >/dev/null 2>&1 || true
+    fi
+    sysctl -w "net.ipv4.ip_forward=${ORIGINAL_IP_FORWARD}" >/dev/null 2>&1 || true
+    if [[ -n "$previous_binary" ]]; then
+      if ! atomic_install_file "$previous_binary" "$INSTALL_PATH" 0755; then
+        warn "KRYTYCZNE: nie udało się przywrócić poprzedniego pliku ${INSTALL_PATH}."
+      fi
+    else
+      rm -f -- "$INSTALL_PATH"
+    fi
+    rm -f -- "$previous_binary"
+    die "WireGuard nie został zainstalowany. Powyżej znajduje się właściwy błąd."
+  fi
+  rm -f -- "$previous_binary"
+
+  if (( create_client == 1 )); then
+    release_lock
+    if ! (add_client "$first_client" auto); then
+      warn "Serwer działa, ale nie udało się utworzyć pierwszego klienta."
+      warn "Dodaj go później poleceniem: sudo ${APP_NAME} add ${first_client} admin"
+    fi
+  else
+    release_lock
+  fi
+
+  ok "Instalacja zakończona."
+  printf '\nEndpoint:        %s:%s/UDP\n' "$ENDPOINT" "$WG_PORT"
+  printf 'Podsieć VPN:     %s\n' "$VPN_CIDR"
+  printf 'Polityka:        %s\n' "$POLICY"
+  printf 'Sloty adminów:   %s (adresy klientów .2-.%s w trybie auto)\n' "$ADMIN_SLOTS" "$((ADMIN_SLOTS + 1))"
+  printf 'Dostęp do VPS:   zablokowany od strony VPN\n'
+  printf 'Internet:        pozostaje na lokalnym łączu klienta\n\n'
+  printf 'Dodaj admina:    sudo %s add NAZWA admin\n' "$APP_NAME"
+  printf 'Dodaj członka:   sudo %s add NAZWA member\n' "$APP_NAME"
+  printf 'Lista klientów:  sudo %s list\n' "$APP_NAME"
+}
+
+restore_runtime_state() {
+  local was_enabled=$1 was_active=$2 status=0
+  if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null; then
+    warn "Nie udało się ponownie włączyć net.ipv4.ip_forward podczas wycofywania deinstalacji."
+    status=1
+  fi
+  if ! firewall_up; then
+    warn "Nie udało się odtworzyć reguł firewalla podczas wycofywania deinstalacji."
+    status=1
+  fi
+  if (( was_enabled == 1 )) && ! systemctl enable "wg-quick@${WG_IF}" >/dev/null; then
+    warn "Nie udało się ponownie włączyć usługi wg-quick@${WG_IF}."
+    status=1
+  fi
+  if (( was_active == 1 )) && ! systemctl start "wg-quick@${WG_IF}"; then
+    warn "Nie udało się ponownie uruchomić usługi wg-quick@${WG_IF}."
+    status=1
+  fi
+  return "$status"
+}
+
+uninstall_server() {
+  require_root
+  local assume_yes=0
+  [[ ${1:-} == "--yes" ]] && assume_yes=1
+  acquire_lock
+  load_settings
+
+  if (( assume_yes == 0 )); then
+    warn "Operacja usunie konfigurację, profile i wszystkie klucze."
+    local answer
+    read -r -p "Wpisz USUN, aby kontynuować: " answer
+    [[ "$answer" == "USUN" ]] || die "Anulowano."
+  fi
+
+  local was_active=0 was_enabled=0
+  systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null && was_active=1
+  systemctl is-enabled --quiet "wg-quick@${WG_IF}" 2>/dev/null && was_enabled=1
+
+  if ! systemctl disable --now "wg-quick@${WG_IF}" >/dev/null; then
+    restore_runtime_state "$was_enabled" "$was_active" || true
+    die "Nie udało się zatrzymać usługi WireGuard. Konfiguracja nie została usunięta."
+  fi
+  if ! firewall_down; then
+    restore_runtime_state "$was_enabled" "$was_active" ||
+      warn "Automatyczne odtworzenie działania serwera nie powiodło się w pełni."
+    die "Nie udało się usunąć reguł firewalla. Konfiguracja nie została usunięta."
+  fi
+
+  local original_forward=$ORIGINAL_IP_FORWARD config
+  config=$(wg_config_path)
+  if ! sysctl -w "net.ipv4.ip_forward=${original_forward}" >/dev/null; then
+    restore_runtime_state "$was_enabled" "$was_active" ||
+      warn "Automatyczne odtworzenie działania serwera nie powiodło się w pełni."
+    die "Nie udało się przywrócić net.ipv4.ip_forward. Konfiguracja nie została usunięta."
+  fi
+
+  rm -f -- "$config" "$SYSCTL_FILE"
+  rm -rf -- "$STATE_DIR"
+  release_lock
+  rm -f -- "$INSTALL_PATH"
+  ok "Usunięto ${APP_NAME}. Pakiety systemowe pozostawiono."
+}
+
+main() {
+  local command=${1:-}
+  case "$command" in
+    install) install_server "$@" ;;
+    add) add_client "${2:-}" "${3:-auto}" ;;
+    set-role|role) set_client_role "${2:-}" "${3:-}" ;;
+    remove|rm|delete|revoke) remove_client "${2:-}" ;;
+    list|ls) list_clients ;;
+    show) show_client "${2:-}" ;;
+    qr) qr_client "${2:-}" ;;
+    export) export_client "${2:-}" "${3:-}" ;;
+    status) show_status ;;
+    doctor|check) doctor ;;
+    restart) restart_service ;;
+    set-endpoint) set_endpoint "${2:-}" "${3:-}" ;;
+    set-policy) set_policy "${2:-}" "${3:-}" ;;
+    backup) backup_state "${2:-}" ;;
+    update) self_update ;;
+    uninstall) uninstall_server "${2:-}" ;;
+    _firewall-up) firewall_up ;;
+    _firewall-down) firewall_down ;;
+    version|--version|-V) printf '%s %s\n' "$APP_NAME" "$VERSION" ;;
+    help|--help|-h|'') usage ;;
+    *) die "Nieznane polecenie: ${command}. Użyj --help." ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

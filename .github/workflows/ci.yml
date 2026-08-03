@@ -1,0 +1,135 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bash-audit:
+    name: Audyt Bash
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalacja narzędzi audytowych
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml
+          shellcheck --version
+
+      - name: Walidacja workflow
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 tests/validate-workflow.py .github/workflows/ci.yml
+
+      - name: Weryfikacja sumy źródła
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd src
+          sha256sum -c mikrus-wg.sha256
+
+      - name: Audyt spójności repozytorium
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 tests/repository-audit.py
+
+      - name: Sprawdzenie składni Bash
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n \
+            install.sh \
+            preflight.sh \
+            configure-repository.sh \
+            src/mikrus-wg \
+            tests/smoke.sh \
+            tests/firewall-mock.sh \
+            tests/config-mock.sh \
+            tests/install-mock.sh \
+            tests/bootstrap-mock.sh \
+            tests/update-mock.sh
+
+      - name: ShellCheck
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          shellcheck --severity=warning \
+            install.sh \
+            preflight.sh \
+            configure-repository.sh \
+            src/mikrus-wg \
+            tests/smoke.sh \
+            tests/firewall-mock.sh \
+            tests/config-mock.sh \
+            tests/install-mock.sh \
+            tests/bootstrap-mock.sh \
+            tests/update-mock.sh
+
+      - name: Testy dymne
+        shell: bash
+        run: bash tests/smoke.sh
+
+      - name: Testy firewalla
+        shell: bash
+        run: bash tests/firewall-mock.sh
+
+      - name: Testy konfiguracji i transakcji
+        shell: bash
+        run: bash tests/config-mock.sh
+
+      - name: Test instalacji i wycofania
+        shell: bash
+        run: bash tests/install-mock.sh
+
+      - name: Test bootstrapu i sum kontrolnych
+        shell: bash
+        run: bash tests/bootstrap-mock.sh
+
+      - name: Test bezpiecznej aktualizacji
+        shell: bash
+        run: bash tests/update-mock.sh
+
+  powershell-audit:
+    name: Audyt PowerShell
+    runs-on: windows-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Sprawdzenie składni PowerShell
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'examples/windows-rdp-firewall.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
