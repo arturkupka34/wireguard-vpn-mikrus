@@ -1,0 +1,9 @@
+*.conf
+*.key
+*.pub
+*.psk
+*.tar.gz
+.env
+secrets/
+clients/
+.DS_Store
