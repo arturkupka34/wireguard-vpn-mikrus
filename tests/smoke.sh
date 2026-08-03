@@ -37,7 +37,7 @@ for script in "${scripts[@]}"; do
 done
 
 version=$(bash "$ROOT/src/mikrus-wg" version)
-[[ "$version" == "mikrus-wg 3.2.1" ]] || fail "nieprawidłowa wersja: $version"
+[[ "$version" == "mikrus-wg 3.2.2" ]] || fail "nieprawidłowa wersja: $version"
 
 help=$(bash "$ROOT/src/mikrus-wg" --help)
 grep -q "prywatny split-tunnel" <<<"$help" || fail "brak opisu split-tunnel"
@@ -104,7 +104,7 @@ validate_keepalive "0"
 validate_keepalive "25"
 validate_admin_slots "5"
 validate_custom_ports "tcp:3389,udp:3389,tcp:22,icmp"
-validate_ref "v3.2.1"
+validate_ref "v3.2.2"
 validate_repository "arturkupka34/wireguard-vpn-mikrus"
 validate_wg_key "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 NETWORK_BASE="10.77.77"

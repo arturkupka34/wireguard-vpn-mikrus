@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TEXT_SUFFIXES = {".sh", ".py", ".ps1", ".yml", ".yaml", ".md", ".txt", ".example", ""}
-EXPECTED_VERSION = "3.2.1"
+EXPECTED_VERSION = "3.2.2"
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 
@@ -68,6 +68,27 @@ def main() -> None:
         fail("plik ustawień byłby wykonywany jako kod Bash")
     if re.search(r"\beval\b", main_text):
         fail("program produkcyjny zawiera eval")
+
+    shell_sources = [
+        ROOT / "install.sh",
+        ROOT / "preflight.sh",
+        ROOT / "configure-repository.sh",
+        ROOT / "src/mikrus-wg",
+        *sorted((ROOT / "tests").glob("*.sh")),
+    ]
+    declaration_with_command = re.compile(
+        r"^[ \t]*(?:local|declare|typeset)\b[^#\n]*=([^#\n]*\$\()",
+        flags=re.MULTILINE,
+    )
+    for script in shell_sources:
+        script_text = texts[script]
+        match = declaration_with_command.search(script_text)
+        if match:
+            line_number = script_text.count("\n", 0, match.start()) + 1
+            fail(
+                "deklaracja zmiennej łączy przypisanie z podstawieniem polecenia "
+                f"(ShellCheck SC2155): {script.relative_to(ROOT)}:{line_number}"
+            )
 
     checksum_line = (ROOT / "src/mikrus-wg.sha256").read_text(encoding="ascii").strip()
     match = re.fullmatch(r"([0-9a-f]{64})  mikrus-wg", checksum_line)

@@ -1,4 +1,4 @@
-# Audyt wydania 3.2.1
+# Audyt wydania 3.2.2
 
 ## Zakres
 
@@ -7,6 +7,7 @@ Audyt obejmuje wszystkie pliki wykonywalne projektu, generowanie konfiguracji Wi
 ## Kontrole wykonywane przez `make test`
 
 - składnia wszystkich skryptów Bash przez `bash -n`;
+- lokalna regresja SC2155: brak deklaracji zmiennych połączonych z podstawieniem polecenia;
 - składnia i podstawowa struktura `.github/workflows/ci.yml` przez PyYAML;
 - zgodność `src/mikrus-wg` z `src/mikrus-wg.sha256`;
 - walidatory nazw, endpointów, portów, podsieci, ról, kluczy i reguł `custom`;

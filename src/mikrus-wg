@@ -7,7 +7,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly APP_NAME="mikrus-wg"
-readonly VERSION="3.2.1"
+readonly VERSION="3.2.2"
 readonly INSTALL_PATH="/usr/local/sbin/${APP_NAME}"
 readonly STATE_DIR="/etc/mikrus-wg"
 readonly WIREGUARD_DIR="/etc/wireguard"
@@ -1584,8 +1584,9 @@ backup_state() {
   acquire_lock
   load_settings
 
-  local destination=${1:-"/root/mikrus-wg-backup-$(date +%Y%m%d-%H%M%S).tar.gz"}
+  local destination
   local state_rel config config_rel sysctl_rel absolute_destination parent_input parent base temp_archive
+  destination=${1:-"/root/mikrus-wg-backup-$(date +%Y%m%d-%H%M%S).tar.gz"}
   local state_real wireguard_real client_dir name path
 
   state_rel=${STATE_DIR#/}

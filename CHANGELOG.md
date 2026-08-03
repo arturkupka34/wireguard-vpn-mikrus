@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.2
+
+- poprawiono ostrzeżenie ShellCheck SC2155 w funkcji tworzenia kopii zapasowej: deklaracja zmiennej i przypisanie z `date` są teraz rozdzielone;
+- dodano lokalną kontrolę regresji wykrywającą deklaracje `local`/`declare`/`typeset` połączone z podstawieniem polecenia;
+- zaktualizowano numer wydania i ponownie przeliczono `src/mikrus-wg.sha256`.
+
 ## 3.2.1
 
 - zapisano workflow GitHub Actions jako czytelny YAML i dodano osobną walidację jego struktury;

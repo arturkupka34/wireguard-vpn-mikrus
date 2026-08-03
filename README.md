@@ -1,6 +1,6 @@
 # WireGuard VPN dla Mikrusa `xander504`
 
-**Wydanie:** `3.2.1`
+**Wydanie:** `3.2.2`
 
 Lekki serwer WireGuard typu **split-tunnel** do prywatnych połączeń między urządzeniami: RDP, SSH, administracja routerami, panele WWW i inne usługi dostępne przez adresy VPN.
 
