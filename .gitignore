@@ -1,9 +1,11 @@
-*.conf
+# Wyklucz wszystkie wygenerowane klucze i pliki konfiguracyjne klientów
+/etc_wireguard/
+/clients/
 *.key
-*.pub
+*.conf
 *.psk
-*.tar.gz
-.env
-secrets/
-clients/
+
+# Pliki tymczasowe i systemowe
 .DS_Store
+*.swp
+*.tmp
